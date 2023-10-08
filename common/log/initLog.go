@@ -1,6 +1,7 @@
 package log
 
 import (
+	"fmt"
 	"go.uber.org/zap"
 	"sync"
 )
@@ -11,7 +12,12 @@ var instance *zap.SugaredLogger
 func GetLog() *zap.SugaredLogger {
 	once.Do(func() {
 		logger, _ := zap.NewDevelopment()
-		defer logger.Sync() // flushes buffer, if any
+		defer func() {
+			err := logger.Sync()
+			if err != nil {
+				fmt.Println(err)
+			}
+		}() // flushes buffer, if any
 		instance = logger.Sugar()
 		instance.Infof("success to init zapLog")
 	},

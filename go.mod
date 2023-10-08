@@ -3,7 +3,6 @@ module go-raftkv
 go 1.20
 
 require (
-	github.com/mitchellh/go-homedir v1.1.0
 	github.com/rosedblabs/rosedb/v2 v2.3.3
 	github.com/rpcxio/rpcx-examples v1.1.6
 	github.com/smallnest/rpcx v1.8.0
