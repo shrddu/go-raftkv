@@ -7,28 +7,24 @@
 
 *
 */
-package consensus
+package node
 
 import (
 	"github.com/mitchellh/mapstructure"
-	"go-raftkv/common/log"
 	"go-raftkv/common/rpc"
-	"go-raftkv/server/node"
 	"math"
 	"strings"
 	"sync"
 	"time"
 )
 
-var Log = log.GetLog()
-
 type Consensus struct {
-	Node       *node.Node
+	Node       *Node
 	voteLock   *sync.Mutex
 	appendLock *sync.Mutex
 }
 
-func NewConsensus(node *node.Node) *Consensus {
+func NewConsensus(node *Node) *Consensus {
 	voteLock := &sync.Mutex{}
 	appendLock := &sync.Mutex{}
 	return &Consensus{Node: node, voteLock: voteLock, appendLock: appendLock}
@@ -52,13 +48,14 @@ func (con *Consensus) HandlerRequestVote(args *any, reply *any) error {
 		return err
 	}
 	defer func() {
-		*args = reqVoteParam
-		*reply = reqVoteResult
+		*args = *reqVoteParam
+		*reply = *reqVoteResult
 	}()
-	Log.Infof("%s get a vote req ,args : %+v ", con.Node.SelfAddr, reqVoteParam)
+	Log.Infof("%s get a vote req ,args : %+v", con.Node.SelfAddr, reqVoteParam)
 
 	// 如果获取锁失败
 	if !con.voteLock.TryLock() {
+		Log.Warnf("node %s consensus fail to get a voteLock , so fail to get a vote", con.Node.SelfAddr)
 		reqVoteResult.IsVoted = false
 		reqVoteResult.Term = con.Node.CurrentTerm
 		return nil
@@ -66,6 +63,7 @@ func (con *Consensus) HandlerRequestVote(args *any, reply *any) error {
 	defer con.voteLock.Unlock()
 	// 如果对方任期小于自己
 	if reqVoteParam.Term < con.Node.CurrentTerm {
+		Log.Warnf("node %s term is smaller than node %s , so fail to win a vote", reqVoteParam.ServiceId, con.Node.SelfAddr)
 		reqVoteResult.IsVoted = false
 		reqVoteResult.Term = con.Node.CurrentTerm
 		return nil
@@ -86,8 +84,9 @@ func (con *Consensus) HandlerRequestVote(args *any, reply *any) error {
 				return nil
 			}
 		}
+		Log.Infof("node %s vote for %s and become a follower", con.Node.SelfAddr, reqVoteParam.ServiceId)
 		// 成功投票并且设置leader为对方，即使对方选举失败，也会进入新的term,从而有新的心跳来更新自己的leader
-		con.Node.State = node.FOLLOWER
+		con.Node.State = FOLLOWER
 		con.Node.LeaderAddr = reqVoteParam.ServiceId
 		con.Node.CurrentTerm = reqVoteParam.Term
 		con.Node.VotedFor = ""
@@ -108,7 +107,9 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 	if err := mapstructure.Decode(*reply, appendResult); err != nil {
 		return err
 	}
-	Log.Infof("%s get a vote req ,args : %+v ", con.Node.SelfAddr, appendEntriesArgs)
+	if appendEntriesArgs.Entries == nil || len(*appendEntriesArgs.Entries) == 0 {
+		Log.Infof("%s get a heartbeat req ,args : %+v ", con.Node.SelfAddr, appendEntriesArgs)
+	}
 	defer func() {
 		*args = appendEntriesArgs
 		*reply = appendResult
@@ -126,18 +127,20 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 		return nil
 	}
 	// 更新心跳
-	con.Node.PreHeartBeatTime = time.Now().Unix()
+	con.Node.PreHeartBeatTime = time.Now().UnixMilli()
 	// 只要发送了心跳说明当前周期还在持续，相当于延缓下次选举时间
-	con.Node.PreElectionTime = time.Now().Unix()
+	con.Node.PreElectionTime = time.Now().UnixMilli()
 	con.Node.LeaderAddr = appendEntriesArgs.LeaderId
 	if appendEntriesArgs.Term >= con.Node.CurrentTerm {
-		con.Node.State = node.FOLLOWER
+		if appendEntriesArgs.Term != con.Node.CurrentTerm {
+			Log.Infof("node : %s become follower , newTerm : %d , LeaderId : %s", con.Node.SelfAddr, appendEntriesArgs.Term, appendEntriesArgs.LeaderId)
+		}
+		con.Node.State = FOLLOWER
 		con.Node.CurrentTerm = appendEntriesArgs.Term
-		Log.Infof("node : %s become follower , newTerm : %d , LeaderId : %s", con.Node.SelfAddr, appendEntriesArgs.Term, appendEntriesArgs.LeaderId)
 	}
 	//情况1：心跳 心跳不仅要更新心跳时间，也要根据leader的信息对自己的信息进行变更
 	if appendEntriesArgs.Entries == nil || len(*appendEntriesArgs.Entries) == 0 {
-		Log.Infof("leader %s send a heartbeat to node %s", appendEntriesArgs.LeaderId, con.Node.SelfAddr)
+		Log.Infof("node %s reveice a heartbeat form leader %s ", con.Node.SelfAddr, appendEntriesArgs.LeaderId)
 
 		nextCommit := con.Node.CommitIndex + 1
 		//如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 当前日志的最后一个Index
@@ -153,9 +156,10 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 			if success := con.Node.StateMachine.Set(con.Node.Config.LogModule.Get(nextCommit)); success {
 				Log.Infof("node %s apply a entry to stateMachine successfully", con.Node.SelfAddr)
 			} else {
-				Log.Fatalf("node %s apply a entry to stateMachine failed", con.Node.SelfAddr)
+				Log.Errorf("node %s apply a entry to stateMachine failed", con.Node.SelfAddr)
 			}
 		}
+		Log.Infof("node %s handler a heartbeat from %s successfully", con.Node.SelfAddr, appendEntriesArgs.LeaderId)
 		appendResult.Success = true
 		appendResult.Term = con.Node.CurrentTerm
 		return nil
@@ -203,7 +207,7 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 	// 所以不符合条件的情况处理完成后
 	// 写进日志 ，这不是提交，所以commitIndex不用变，等下一次发来心跳时再更新commitIndex,也就是说当leader发现过半收到新日志时，会在下一次发布心跳时携带更新后的commitIndex让follower同步
 	for _, entry := range *appendEntriesArgs.Entries {
-		con.Node.Config.LogModule.Write(&entry)
+		con.Node.Config.LogModule.Set(&entry)
 	}
 	// 更新node信息
 	// 下一个需要提交的日志的索引（如有）
@@ -227,12 +231,12 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 		entry := con.Node.Config.LogModule.Get(nextCommit)
 		success := con.Node.StateMachine.Set(entry)
 		if success == false {
-			Log.Fatalf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
+			Log.Errorf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
 		}
 		nextCommit++
 	}
 	appendResult.Success = true
 	appendResult.Term = con.Node.CurrentTerm
-	con.Node.State = node.FOLLOWER
+	con.Node.State = FOLLOWER
 	return nil
 }

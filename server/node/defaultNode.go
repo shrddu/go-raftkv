@@ -7,10 +7,10 @@ import (
 	"github.com/smallnest/rpcx/server"
 	"go-raftkv/common/log"
 	"go-raftkv/common/rpc"
-	"go-raftkv/server/consensus"
 	"go-raftkv/server/logmodule"
 	"go-raftkv/server/membershipchange"
 	"go-raftkv/server/statemachine"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -27,6 +27,7 @@ var (
     相比之下，使用指针传递结构体只需要传递指向结构体的地址，而不会进行真正的拷贝操作，做到节省时间和内存，效率更高
    2. 同时使用指针还可以实现结构体字段的可选性，通过使用指针类型的字段，可以将其设为nil来表示起字段不需要使用或者没有提供值，在部分场景下非常有用。
     使用指针传递结构体可以提高性能并允许字段的可选性。然而，如果结构体较小或者包含少量字段，使用值类型传递也是可以的，因为拷贝的开销相对较小。选择指针传递还是值类型传递取决于具体的情况和需求。
+(2)当父协程是main协程时，父协程退出，父协程下的所有子协程也会跟着退出；当父协程不是main协程时，父协程退出，父协程下的所有子协程并不会跟着退出（子协程直到自己的所有逻辑执行完或者是main协程结束才结束）
 */
 
 //	Node server节点
@@ -39,14 +40,14 @@ type Node struct {
 
 	// 选举时间超时限制
 	ElectionTime int64
-	// 上一次选举时间 可以通过append方法触发或者RequestVote
+	// 上一次选举时间 可以通过append方法触发或者RequestVote 单位milliseconds
 	PreElectionTime int64
-	// 选举间隔
+	// 选举间隔 单位milliseconds
 	ElectionTick int64
 
-	/** 上次一心跳时间戳  心跳通过append方法触发，分为 EmptyEntriesAppend和 正常的AppendEntries*/
+	/** 上次一心跳时间戳  心跳通过append方法触发，分为 EmptyEntriesAppend和 正常的AppendEntries 单位milliseconds*/
 	PreHeartBeatTime int64
-	/** 心跳间隔基数 */
+	/** 心跳间隔基数 单位milliseconds*/
 	HeartBeatTick int64
 
 	/**
@@ -83,7 +84,7 @@ type Node struct {
 	// 状态机
 	StateMachine *statemachine.StateMachine
 	/* 一致性模块 */
-	Consensus *consensus.Consensus
+	Consensus *Consensus
 	/* 成员变更模块 */
 	Membership *membershipchange.MembershipChanges
 }
@@ -114,21 +115,21 @@ func (node *Node) Init() {
 	node.nextIndexs = &map[string]int64{}
 	node.copiedIndexs = &map[string]int64{}
 	node.StateMachine = statemachine.GetInstance(node.Config.SelfPort)
-	node.Consensus = consensus.NewConsensus(node)
+	node.Consensus = NewConsensus(node)
 	// TODO 完善membershipchange
 	node.Membership = &membershipchange.MembershipChanges{}
 
 	//TODO LinkedBlockingQueue 一个队列
 	//处理LinkedBlockingQueue中存储的的失败事件
 	//TODO ReplicationFailQueueConsumer 一个处理队列内失败任务的消费者
-
-	// 异步开启
-	node.initTickerWork()
-
-	if lastIndex := node.Config.LogModule.GetLastIndex(); lastIndex != 0 {
-		entry := node.Config.LogModule.Get(lastIndex)
-		node.CurrentTerm = entry.Term
+	if lastEntry := node.Config.LogModule.GetLastEntry(); lastEntry != nil {
+		node.CurrentTerm = lastEntry.Term
 	}
+	// 异步开启
+	go func() {
+		node.initTickerWork()
+	}()
+
 	Log.Infof("%s start success ...", node.SelfAddr)
 	// 所有配置初始化完成后注册server
 	s := server.NewServer()
@@ -149,9 +150,10 @@ func (node *Node) initTickerWork() {
 			node.heartBeatTask()
 		}
 	}(time.NewTicker(time.Duration(node.HeartBeatTick) * time.Millisecond))
+
 	// 启动选举任务
+	time.Sleep(3000 * time.Millisecond)
 	go func(t *time.Ticker) {
-		time.Sleep(5000 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
 			node.electionTask()
@@ -185,11 +187,11 @@ func (node *Node) heartBeatTask() {
 	if node.State != LEADER {
 		return
 	}
-	if time.Now().Unix()-node.PreHeartBeatTime < node.HeartBeatTick {
+	if time.Now().UnixMilli()-node.PreHeartBeatTime < node.HeartBeatTick {
 		return
 	}
-	Log.Infoln(node.SelfAddr + "start to heartBeat")
-	peers := getPeerAddrsWithOutSelf(node)
+	Log.Infoln(node.SelfAddr + " start a heartBeat")
+	peers := node.getPeerAddrsWithOutSelf()
 	for _, peer := range peers {
 		args := &rpc.AppendEntriesArgs{
 			Term:         node.CurrentTerm,
@@ -206,26 +208,33 @@ func (node *Node) heartBeatTask() {
 			Args:          args,
 		}
 		/*异步发送心跳*/
+		peerCopy := peer
 		go func() {
 			reply := node.Config.RpcClient.Send(request)
-			result := reply.(*rpc.AppendResult)
-			term := result.Term
-			if term > node.CurrentTerm {
-				Log.Infof("self will be a follower,self term : %d ,new term : %d ", node.CurrentTerm, term)
-				node.CurrentTerm = term
-				node.VotedFor = ""
-				node.State = FOLLOWER
+			if reply != nil {
+				result := reply.(*rpc.AppendResult)
+				term := result.Term
+				if term > node.CurrentTerm {
+					Log.Warnf("node %s will be a follower,self term : %d ,new term : %d ", node.SelfAddr, node.CurrentTerm, term)
+					node.CurrentTerm = term
+					node.VotedFor = ""
+					node.State = FOLLOWER
+				}
+			} else {
+				Log.Warnf("node %s send a heartbeat to %s failed ", node.SelfAddr, peerCopy)
 			}
 		}()
 	}
 
 }
-func getPeerAddrsWithOutSelf(node *Node) []string {
+func (node *Node) getPeerAddrsWithOutSelf() []string {
 	peers := node.Config.PeerAddrs
-	var peersWithoutSelf []string
+	peersWithoutSelf := make([]string, len(peers)-1)
+	index := 0
 	for _, peer := range peers {
 		if peer != node.SelfAddr {
-			peersWithoutSelf = append(peersWithoutSelf, peer)
+			peersWithoutSelf[index] = peer
+			index++
 		}
 	}
 	return peersWithoutSelf
@@ -240,27 +249,30 @@ func (node *Node) electionTask() {
 	if node.State == LEADER {
 		return
 	}
-	if time.Now().Unix()-node.PreElectionTime < node.ElectionTick {
+	Log.Infof("now time is %d,subtraction preElectionTime result is : %d", time.Now().UnixMilli(), time.Now().UnixMilli()-node.PreElectionTime)
+	if time.Now().UnixMilli()-node.PreElectionTime < node.ElectionTick || time.Now().UnixMilli()-node.PreHeartBeatTime < 3*node.HeartBeatTick {
 		return
 	}
 	node.State = CANDIDATE
-	Log.Infof("node %s will start electionTask,current term %d", node.SelfAddr, node.CurrentTerm)
-	node.PreElectionTime = time.Now().Unix()
+	Log.Infof("node %s start election,current term %d", node.SelfAddr, node.CurrentTerm)
+	node.PreElectionTime = time.Now().UnixMilli()
 	// 2. 向其他服务器发送vote请求
 	node.VotedFor = node.SelfAddr
-	peers := getPeerAddrsWithOutSelf(node)
+	peers := node.getPeerAddrsWithOutSelf()
 	Log.Infof("node %s will send vote request to peers contains %+v", node.SelfAddr, peers)
 	lastLogIndex := node.Config.LogModule.GetLastIndex()
 	param := &rpc.ReqVoteParam{
 		Term:         node.CurrentTerm,
 		LastLogIndex: lastLogIndex,
-		LastLogTerm:  node.Config.LogModule.Get(lastLogIndex).Term,
 		ServiceId:    node.SelfAddr,
 	}
-
-	var votedCount int64 = 0
+	if lastLogIndex == 0 && node.CurrentTerm == 0 {
+		param.Term = 0
+	} else {
+		param.Term = node.Config.LogModule.Get(lastLogIndex).Term
+	}
 	c := make(chan bool, len(peers))
-	defer close(c)
+	var isChannelClosed int64 = 0
 	for _, peer := range peers {
 		peer := peer
 		go func() {
@@ -272,40 +284,66 @@ func (node *Node) electionTask() {
 				Args:          param,
 			}
 			result := node.Config.RpcClient.Send(request)
-			voteResult := result.(*rpc.ReqVoteResult)
-			if voteResult.IsVoted {
-				c <- true
-			} else {
-				peerTerm := voteResult.Term
-				if peerTerm > node.CurrentTerm {
-					node.CurrentTerm = peerTerm
+			if result != nil {
+				voteResult := result.(*rpc.ReqVoteResult)
+				if voteResult.IsVoted {
+					if atomic.LoadInt64(&isChannelClosed) == 0 {
+						c <- true
+					}
+				} else {
+					peerTerm := voteResult.Term
+					if peerTerm > node.CurrentTerm {
+						node.CurrentTerm = peerTerm
+					}
+					return
 				}
+			} else {
+				Log.Warnf("ReqVote from node %s to %s failed , reply is nil", node.SelfAddr, peer)
+				if atomic.LoadInt64(&isChannelClosed) == 0 {
+					c <- false
+				}
+
 			}
+
 		}()
 	}
-
+	var votedCount int64 = 0
+	var sendedCount int64 = 0
 	// 3. 监听结果，如果半数以上同意则自己term自增1，设置自己为leader
-	for range c {
-		// 如果监听过程中被发送心跳导致状态改变，那就直接停止选举
-		if node.State == FOLLOWER {
-			return
-		}
-		atomic.AddInt64(&votedCount, 1)
-		if votedCount >= (int64)(len(peers)/2) {
-			// 投票成功
-			node.State = LEADER
-			node.LeaderAddr = node.SelfAddr
-			node.CurrentTerm += 1
-			node.VotedFor = ""
-			node.becomeLeaderToDo()
-			Log.Infof("node %s vote success ,new term is %d", node.SelfAddr, node.CurrentTerm)
+	for msg := range c {
+		switch msg {
+		case true:
+			// 如果监听过程中被发送心跳导致状态改变，那就直接停止选举
+			if node.State == FOLLOWER {
+				return
+			}
+			atomic.AddInt64(&votedCount, 1)
+			atomic.AddInt64(&sendedCount, 1)
+			if votedCount >= (int64)(len(peers)/2) {
+				// 公投成功
+				node.State = LEADER
+				node.LeaderAddr = node.SelfAddr
+				node.CurrentTerm += 1
+				node.VotedFor = ""
+				Log.Infof("node %s vote success,new term is %d , now will call 'becomeLeaderToDo()'method ", node.SelfAddr, node.CurrentTerm)
+				node.becomeLeaderToDo()
+				break
+			}
 			break
-		} else {
-			node.VotedFor = ""
+		case false:
+			{
+				Log.Warnf("electionTask : listening a 'false' msg from channel")
+				atomic.AddInt64(&sendedCount, 1)
+				break
+			}
+		}
+		if sendedCount == int64(len(peers)) || node.State == LEADER {
+			atomic.AddInt64(&isChannelClosed, 1)
+			break
 		}
 	}
 
-	node.PreElectionTime = time.Now().Unix()
+	node.PreElectionTime = time.Now().UnixMilli()
 }
 
 /**
@@ -318,27 +356,33 @@ func (node *Node) electionTask() {
 //  @receiver node
 //
 func (node *Node) becomeLeaderToDo() {
-	peers := getPeerAddrsWithOutSelf(node)
+	peers := node.getPeerAddrsWithOutSelf()
 	// 该空entry的index为0，则每个server的logModule的第一个log起表示当前term的作用
 	termEntry := &rpc.LogEntry{
 		Index: 0,
 		Term:  node.CurrentTerm,
+		K:     "",
+		V:     "",
 	}
 	// 提交到本地logModule
-	node.Config.LogModule.Write(termEntry)
+	node.Config.LogModule.Set(termEntry)
 	var count int64 = 0
 	var receivedCount int64 = 0
+	var channelIsClosed int64 = 0
 	c := make(chan bool, len(peers))
-	defer close(c)
 	for _, peer := range peers {
 		peer := peer
 		go func() {
 			isSuccess := node.replication(peer, termEntry)
 			if isSuccess {
-				c <- true
+				if atomic.LoadInt64(&channelIsClosed) == 0 {
+					c <- true
+				}
 			} else {
-				c <- false
-				Log.Warnf("replication form %s to %s has failed", node.SelfAddr, peer)
+				if atomic.LoadInt64(&channelIsClosed) == 0 {
+					c <- false
+					Log.Warnf("replication form %s to %s has failed", node.SelfAddr, peer)
+				}
 			}
 		}()
 	}
@@ -347,29 +391,37 @@ func (node *Node) becomeLeaderToDo() {
 		if msg {
 			atomic.AddInt64(&count, 1)
 			if count >= (int64)(len(peers)/2) {
+				if channelIsClosed != 0 {
+					break
+				}
 				node.StateMachine.Set(termEntry)
 				Log.Infof("success to update peers' new term : %d", node.CurrentTerm)
-				break
+				atomic.AddInt64(&channelIsClosed, 1)
+				close(c)
 			}
 		}
 		if receivedCount == int64(len(peers)) {
-			Log.Fatalf("fail to update peers' new term , leader : %s ,term : %s", node.SelfAddr, node.CurrentTerm)
+			Log.Warnf("fail to update peers' new term , leader : %s ,term : %s", node.SelfAddr, node.CurrentTerm)
 			// 没有更新到所有follower，成为leader的行为失败，当前term失效，设置自己为candidate
 			node.State = FOLLOWER
-			break
+			atomic.AddInt64(&channelIsClosed, 1)
+			close(c)
 		}
 	}
 }
 
 func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 	// 1. 10s内可以重复尝试(rpc超时时间3s)
-	start := time.Now().Unix()
-	end := time.Now().Unix()
+	start := time.Now().UnixMilli()
+	end := time.Now().UnixMilli()
 	for end-start < 10*1000 {
 		args := &rpc.AppendEntriesArgs{
 			Term:         node.CurrentTerm,
 			ServerId:     peer,
 			LeaderId:     node.LeaderAddr,
+			PrevLogIndex: int64(math.Max(float64(0), float64(entry.Index-1))),
+			PreLogTerm:   node.Config.LogModule.Get(int64(math.Max(float64(0), float64(entry.Index-1)))).Term,
+			Entries:      nil,
 			LeaderCommit: node.CommitIndex,
 		}
 		nextIndex := (*node.nextIndexs)[peer]
@@ -404,7 +456,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 		if reply != nil {
 			appendResult := reply.(*rpc.AppendResult)
 			if appendResult.Success {
-				Log.Infof("replication logEntry {%+v}from %s to %s has been success", entry, node.SelfAddr, peer)
+				Log.Infof("replication logEntry {%+v}from %s to %s now is success", entry, node.SelfAddr, peer)
 				(*node.nextIndexs)[peer] = entry.Index + 1
 				(*node.copiedIndexs)[peer] = entry.Index
 				return true
@@ -412,7 +464,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 				// 分析原因
 				// 1. 对方周期大于自己
 				if appendResult.Term > node.CurrentTerm {
-					Log.Errorf("follower %s term is bigger than leader %s ,leader term changed to %d", peer, node.SelfAddr, appendResult.Term)
+					Log.Warnf("follower %s term is bigger than leader %s ,leader term changed to %d", peer, node.SelfAddr, appendResult.Term)
 					node.CurrentTerm = appendResult.Term
 					node.State = FOLLOWER
 					return false
@@ -430,7 +482,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 		} else {
 			// 重试
 		}
-		end = time.Now().Unix()
+		end = time.Now().UnixMilli()
 	}
 	// 超时
 	return false
@@ -467,7 +519,7 @@ func (node *Node) Destroy() {
 //	@param reply 必须是明确的指针
 //	@return error
 func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *any) error {
-	Log.Infof("Get a ClientRequest ,args:%+v,reply:%+v", *args, *reply) //将指针指向的interface 取反得到interface类型，这样就可以正常通过%v来输出他的值了
+	Log.Infof("Get a ClientRequest ,args:%+v", *args) //将指针指向的interface 取反得到interface类型，这样就可以正常通过%v来输出他的值了
 	//rpcArgs := (args).(rpc.ClientRPCArgs) //将指针指向的interface自动转换为指定类型时，会掉进golang自动转换的陷阱，不要用这种方法来转换
 	/*转换any为具体参数、回复类型*/
 	argsStruct := &rpc.ClientRPCArgs{}
@@ -488,7 +540,7 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 	/*进行业务操作*/
 	Log.Infof("HandlerClientRequest Method get a client request : %+v ", argsStruct)
 	if node.State != LEADER {
-		Log.Errorf("node %s get a clientRequest,but not a leader ,redirect to leader %s", node.SelfAddr, node.LeaderAddr)
+		Log.Warnf("node %s get a clientRequest,but not a leader ,redirect to leader %s", node.SelfAddr, node.LeaderAddr)
 		return node.Redirect(ctx, args, reply)
 	}
 	// GET
@@ -511,12 +563,13 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 		V:     argsStruct.V,
 	}
 	// 预提交，如果成功大于一半，就应用到状态机，否则删除该log之后的所有内容，从而回滚
-	node.Config.LogModule.Write(logEntry)
+	node.Config.LogModule.Set(logEntry)
 	Log.Infof("PRE-COMMIT: write a entry{%+v} into node %s's logModule", logEntry, node.SelfAddr)
 	// 复制到其他节点，观察成功数占比
-	peers := getPeerAddrsWithOutSelf(node)
+	peers := node.getPeerAddrsWithOutSelf()
 	var count int64 = 0
 	var sendedCount int64 = 0
+	var isChannelClosed int64 = 0
 	c := make(chan bool, len(peers))
 	defer close(c)
 	for _, peer := range peers {
@@ -524,9 +577,13 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 		go func() {
 			isSuccess := node.replication(peer, logEntry)
 			if isSuccess {
-				c <- true
+				if atomic.LoadInt64(&isChannelClosed) == 0 {
+					c <- true
+				}
 			} else {
-				c <- false
+				if atomic.LoadInt64(&isChannelClosed) == 0 {
+					c <- false
+				}
 			}
 		}()
 	}
@@ -542,12 +599,13 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 				Log.Infof("success apply stateMachine, logEntry info : {%+v}", logEntry)
 				replyStruct.Success = true
 				replyStruct.Entry = *logEntry
+				atomic.AddInt64(&isChannelClosed, 1)
 				return nil
 			}
 		} else {
 			if sendedCount == int64(len(peers)) {
 				// 一半以上没接收到，需要回滚
-				Log.Fatalf("node %s fail apply statMachine entry:{%+v}", node.SelfAddr, logEntry)
+				Log.Warnf("node %s fail apply statMachine entry:{%+v}", node.SelfAddr, logEntry)
 				err := node.Config.LogModule.DeleteOnStartIndex(logEntry.Index)
 				replyStruct.Success = false
 				replyStruct.Entry = *logEntry

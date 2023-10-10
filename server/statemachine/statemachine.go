@@ -1,7 +1,8 @@
 package statemachine
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 	"github.com/rosedblabs/rosedb/v2"
 	"go-raftkv/common/log"
 	"go-raftkv/common/rpc"
@@ -24,6 +25,7 @@ func GetInstance(selfPort string) *StateMachine {
 		instance = &StateMachine{}
 		instance.Init(selfPort)
 	})
+	Log.Infof("node %s get a stateMachine %+v", "localhost:"+selfPort, instance)
 	return instance
 }
 
@@ -48,30 +50,61 @@ func (machine *StateMachine) Destroy() {
 	}
 }
 
+// Set
+//
+//	@Description: 保存到状态机 entry.K(string) : entry(LogEntry) 的格式
+//	@receiver machine
+//	@param entry
+//	@return bool
 func (machine *StateMachine) Set(entry *rpc.LogEntry) bool {
-	entryBytes, _ := json.Marshal(entry)
-	err := machine.RSDB.Put([]byte(entry.K), entryBytes)
+	// SetInt64(int64) 参数如果是0的话，会自动转换为nil，所以设置失效，不能使用big.Int{}.setInt64()这种方法
+	if entry.K == "" {
+		Log.Infof("stateMachine doesn't apply empty 'K' entry , method is return")
+		return true
+	}
+	keyBuf := &bytes.Buffer{}
+	entryBuf := &bytes.Buffer{}
+	if err := gob.NewEncoder(keyBuf).Encode(entry.K); err != nil {
+		Log.Warn(err)
+		return false
+	}
+	if err := gob.NewEncoder(entryBuf).Encode(entry); err != nil {
+		Log.Warn(err)
+		return false
+	}
+	err := machine.RSDB.Put(keyBuf.Bytes(), entryBuf.Bytes())
 	if err != nil {
 		panic(err)
 	}
-	Log.Infof("success to set a k and v : %s : %+v", entry.K, entry)
+	Log.Infof("stateMachine : success to set a entry : %+v", entry)
 	return true
 }
 
+// Get
+//
+//	@Description: 传入entry.K 返回 LogEntry
+//	@receiver machine
+//	@param key
+//	@return *rpc.LogEntry
 func (machine *StateMachine) Get(key string) *rpc.LogEntry {
-	val, err := machine.RSDB.Get([]byte(key))
+	keyBuf := &bytes.Buffer{}
+	if err := gob.NewEncoder(keyBuf).Encode(key); err != nil {
+		Log.Warn(err)
+		return nil
+	}
+	val, err := machine.RSDB.Get(keyBuf.Bytes())
 	if err != nil {
 		Log.Error(err)
 		return nil
 	}
-	result := rpc.LogEntry{}
-	err = json.Unmarshal(val, &result)
-	if err != nil {
-		Log.Errorf("fail to Get : %v", err)
+	valueBuf := bytes.NewBuffer(val)
+	entry := &rpc.LogEntry{}
+	if err := gob.NewDecoder(valueBuf).Decode(entry); err != nil {
+		Log.Warn(err)
 		return nil
 	}
-	Log.Infof("success to get value : %+v", result)
-	return &result
+	Log.Infof("success to get value : %+v", entry)
+	return entry
 }
 
 func (machine *StateMachine) Del(key string) bool {

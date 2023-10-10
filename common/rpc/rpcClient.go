@@ -19,28 +19,42 @@ func (dc *RpcClient) Send(request *MyRequest) Reply {
 func (dc *RpcClient) SendWithTimeout(request *MyRequest, time time.Duration) Reply {
 	dc.Init()
 	//区分一下client请求和server请求
+	d, _ := client.NewPeer2PeerDiscovery("tcp@"+request.ServiceId, "")
+	option := client.DefaultOption
+	option.ConnectTimeout = time
+	xclient := client.NewXClient(request.ServicePath, client.Failtry, client.RandomSelect, d, option)
+	defer xclient.Close()
+	var replay Reply
+	// TODO 完善switch
 	switch request.RequestType {
+	case A_ENTRIES:
+		replay = &AppendResult{}
+		break
+	case R_VOTE:
+		replay = &ReqVoteResult{}
+		break
 	case CLIENT_REQ:
-		d, _ := client.NewPeer2PeerDiscovery("tcp@"+request.ServiceId, "")
-		option := client.DefaultOption
-		option.ConnectTimeout = time
-		xclient := client.NewXClient(request.ServicePath, client.Failtry, client.RandomSelect, d, option)
-		defer xclient.Close()
-		replay := &ClientRPCReply{}
-		call, err := xclient.Go(context.Background(), request.ServiceMethod, request.Args, replay, nil)
-		if err != nil {
-			Log.Errorf("failed to send a ClientRPC Request, %+v", err)
-		}
+		replay = &ClientRPCReply{}
+	}
+	Log.Infof("selfNode will send a '%s' type rpc , args :%+v", request.ServiceMethod, request.Args)
+	call, err := xclient.Go(context.Background(), request.ServiceMethod, request.Args, replay, nil)
+	if err != nil {
+		Log.Errorf("failed to send a %s type Request,error : %+v", request.ServiceMethod, err)
+	}
+	if call != nil {
 		replyCall := <-call.Done
 		if replyCall.Error != nil {
 			Log.Fatalf("failed to call : %+v", replyCall.Error)
 		} else {
-			Log.Infof("success to call %s,args: %+v ,reply : %+v", request.ServiceMethod, replyCall.Args, replyCall.Reply)
+			if replyCall.Reply != nil {
+				Log.Infof("success to call %s , the result contains : {args: %+v ,reply : %+v}", request.ServiceMethod, replyCall.Args, replyCall.Reply)
+				return replyCall.Reply
+			} else {
+				Log.Warnf("send a %s type Request successfully,but get a empty reply from %s", request.ServiceMethod, request.ServiceId)
+			}
 		}
-
-		return replyCall.Reply
-		// TODO 完善switch
 	}
+
 	return nil
 
 }
