@@ -35,6 +35,12 @@ func (dc *RpcClient) SendWithTimeout(request *MyRequest, time time.Duration) Rep
 		break
 	case CLIENT_REQ:
 		replay = &ClientRPCReply{}
+		break
+	case MEMBERSHIP_CHANGE_ADD:
+		replay = &MemberAddResult{}
+		break
+	case MEMBERSHIP_CHANGE_SYNC:
+		replay = &SyncPeersResult{}
 	}
 	Log.Infof("selfNode will send a '%s' type rpc , args :%+v", request.ServiceMethod, request.Args)
 	call, err := xclient.Go(context.Background(), request.ServiceMethod, request.Args, replay, nil)

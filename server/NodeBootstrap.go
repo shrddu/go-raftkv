@@ -17,11 +17,12 @@ import (
 
 // ldflags 标签注入port
 var Port = "9990"
+var IsNewNode string = "false"
 var PeerAddrs = []string{"localhost:9990", "localhost:9991", "localhost:9992"}
 
 func main() {
 	flag.Parse()
-	cfg := &node.Config{SelfPort: Port, PeerAddrs: PeerAddrs}
+	cfg := &node.Config{SelfPort: Port, PeerAddrs: PeerAddrs, IsNewNode: IsNewNode}
 	newNode := &node.Node{Config: cfg}
 
 	newNode.Init()

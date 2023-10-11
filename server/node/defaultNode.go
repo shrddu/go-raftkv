@@ -8,7 +8,6 @@ import (
 	"go-raftkv/common/log"
 	"go-raftkv/common/rpc"
 	"go-raftkv/server/logmodule"
-	"go-raftkv/server/membershipchange"
 	"go-raftkv/server/statemachine"
 	"math"
 	"sync/atomic"
@@ -59,6 +58,8 @@ type Node struct {
 	SelfAddr   string
 	// 运行状态
 	IsRunning bool
+	// 当前是否正在进行成员变更，同一时刻只允许一个成员变更
+	IsMemberChanging bool
 
 	// 当前周期
 	CurrentTerm int64 `default:"0"`
@@ -85,11 +86,7 @@ type Node struct {
 	StateMachine *statemachine.StateMachine
 	/* 一致性模块 */
 	Consensus *Consensus
-	/* 成员变更模块 */
-	Membership *membershipchange.MembershipChanges
 }
-
-var Log = log.GetLog()
 
 type Config struct {
 	SelfPort  string
@@ -97,7 +94,11 @@ type Config struct {
 	// rpc客户端
 	RpcClient *rpc.RpcClient
 	LogModule *logmodule.LogModule
+	// 是否是新加节点
+	IsNewNode string
 }
+
+var Log = log.GetLog()
 
 func (node *Node) Init() {
 	Log.Infof("node start init ...")
@@ -116,8 +117,6 @@ func (node *Node) Init() {
 	node.copiedIndexs = &map[string]int64{}
 	node.StateMachine = statemachine.GetInstance(node.Config.SelfPort)
 	node.Consensus = NewConsensus(node)
-	// TODO 完善membershipchange
-	node.Membership = &membershipchange.MembershipChanges{}
 
 	//TODO LinkedBlockingQueue 一个队列
 	//处理LinkedBlockingQueue中存储的的失败事件
@@ -125,12 +124,19 @@ func (node *Node) Init() {
 	if lastEntry := node.Config.LogModule.GetLastEntry(); lastEntry != nil {
 		node.CurrentTerm = lastEntry.Term
 	}
+	// TODO 判断是否是新节点需要加入，发送请求
+	if node.Config.IsNewNode == "true" {
+		node.Config.PeerAddrs = append(node.Config.PeerAddrs, node.SelfAddr)
+		node.NewNodeNeedToDo()
+	}
+
 	// 异步开启
 	go func() {
 		node.initTickerWork()
 	}()
 
 	Log.Infof("%s start success ...", node.SelfAddr)
+
 	// 所有配置初始化完成后注册server
 	s := server.NewServer()
 	err := s.Register(node, "")
@@ -141,6 +147,7 @@ func (node *Node) Init() {
 	if err != nil {
 		panic(err)
 	}
+
 }
 func (node *Node) initTickerWork() {
 	// 启动心跳任务
@@ -623,6 +630,97 @@ func (node *Node) HandlerRequestVote(ctx context.Context, args *any, reply *any)
 func (node *Node) HandlerAppendEntries(ctx context.Context, args *any, reply *any) error {
 	return node.Consensus.HandlerAppendEntries(args, reply)
 }
+func (node *Node) HandlerMemberAdd(ctx context.Context, args *any, reply *any) error {
+	if node.IsMemberChanging {
+		return nil
+	}
+	node.IsMemberChanging = true
+	defer func() {
+		node.IsMemberChanging = false
+	}()
+	memberAddArgs := &rpc.MemberAddArgs{}
+	if err := mapstructure.Decode(*args, memberAddArgs); err != nil {
+		return err
+	}
+	memberAddResult := &rpc.MemberAddResult{}
+	if err := mapstructure.Decode(*reply, memberAddResult); err != nil {
+		return err
+	}
+	defer func() {
+		*args = *memberAddArgs
+		*reply = *memberAddResult
+	}()
+	Log.Infof("%s get a HandlerMemberAdd request ,args : %+v ", node.SelfAddr, memberAddArgs)
+	peers := node.getPeerAddrsWithOutSelf()
+	var syncSuccessCount int = 0
+	for _, peer := range peers {
+		args := &rpc.SyncPeersArgs{
+			PeerAddr:     memberAddArgs.PeerAddr,
+			NewPeerAddrs: memberAddArgs.NewPeerAddrs,
+			CommitIndex:  memberAddArgs.CommitIndex,
+		}
+		request := &rpc.MyRequest{
+			RequestType:   rpc.MEMBERSHIP_CHANGE_SYNC,
+			ServiceId:     peer,
+			ServicePath:   "Node",
+			ServiceMethod: "HandlerMemberChangeSync",
+			Args:          args,
+		}
+		reply := node.Config.RpcClient.Send(request)
+		if reply != nil {
+			result := reply.(*rpc.SyncPeersResult)
+			if result.IsSuccess {
+				Log.Infof("node %s sync new peerSet to %s successfully", node.SelfAddr, peer)
+				syncSuccessCount++
+			} else {
+				Log.Warnf("node %s sync new peerSet to %s failed", node.SelfAddr, peer)
+			}
+		}
+	}
+	if syncSuccessCount == len(peers) {
+		// 同步成功
+		node.Config.PeerAddrs = memberAddArgs.NewPeerAddrs
+		(*node.nextIndexs)[memberAddArgs.PeerAddr] = memberAddArgs.CommitIndex + 1
+		(*node.copiedIndexs)[memberAddArgs.PeerAddr] = memberAddArgs.CommitIndex
+		memberAddResult.IsSuccess = true
+		memberAddResult.Term = node.CurrentTerm
+		memberAddResult.LeaderAddr = node.LeaderAddr
+		return nil
+	}
+	// 同步失败
+	memberAddResult.Term = node.CurrentTerm
+	memberAddResult.IsSuccess = false
+	memberAddResult.LeaderAddr = node.LeaderAddr
+	return nil
+}
+func (node *Node) HandlerMemberChangeSync(ctx context.Context, args *any, reply *any) error {
+	if node.IsMemberChanging {
+		return nil
+	}
+	node.IsMemberChanging = true
+	defer func() {
+		node.IsMemberChanging = false
+	}()
+	syncPeersArgs := &rpc.SyncPeersArgs{}
+	if err := mapstructure.Decode(*args, syncPeersArgs); err != nil {
+		return err
+	}
+	syncPeersResult := &rpc.SyncPeersResult{}
+	if err := mapstructure.Decode(*reply, syncPeersResult); err != nil {
+		return err
+	}
+	defer func() {
+		*args = *syncPeersArgs
+		*reply = *syncPeersResult
+	}()
+
+	node.Config.PeerAddrs = syncPeersArgs.NewPeerAddrs
+	(*node.nextIndexs)[syncPeersArgs.PeerAddr] = syncPeersArgs.CommitIndex + 1
+	(*node.copiedIndexs)[syncPeersArgs.PeerAddr] = syncPeersArgs.CommitIndex
+	// 更改结束
+	syncPeersResult.IsSuccess = true
+	return nil
+}
 func (node *Node) Redirect(ctx context.Context, args *any, reply *any) error {
 	request := &rpc.MyRequest{
 		RequestType:   rpc.CLIENT_REQ,
@@ -634,4 +732,34 @@ func (node *Node) Redirect(ctx context.Context, args *any, reply *any) error {
 	rpcReply := node.Config.RpcClient.Send(request)
 	*reply = rpcReply
 	return nil
+}
+
+func (node *Node) NewNodeNeedToDo() {
+	for {
+		args := &rpc.MemberAddArgs{
+			PeerAddr:     node.SelfAddr,
+			NewPeerAddrs: node.Config.PeerAddrs,
+			CommitIndex:  node.CommitIndex,
+		}
+		request := &rpc.MyRequest{
+			RequestType:   rpc.MEMBERSHIP_CHANGE_ADD,
+			ServiceId:     node.Config.PeerAddrs[0],
+			ServicePath:   "Node",
+			ServiceMethod: "HandlerMemberAdd",
+			Args:          args,
+		}
+		reply := node.Config.RpcClient.Send(request)
+		if reply != nil {
+			result := reply.(*rpc.MemberAddResult)
+			if result.IsSuccess {
+				Log.Infof("node %s success to add self into server set", node.SelfAddr)
+				node.CurrentTerm = result.Term
+				node.LeaderAddr = result.LeaderAddr
+				node.State = FOLLOWER
+				break
+			} else {
+				Log.Warnf("node %s failed to add self into server set , will try again", node.SelfAddr)
+			}
+		}
+	}
 }

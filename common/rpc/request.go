@@ -7,12 +7,16 @@ var (
 	A_ENTRIES = 1
 	// CLIENT_REQ 客户端请求客户端 get / put
 	CLIENT_REQ = 2
-	// CHANGE_CONFIG_ADD 配置变更. add
-	CHANGE_CONFIG_ADD = 3
-	// CHANGE_CONFIG_REMOVE 配置变更. remove
-	CHANGE_CONFIG_REMOVE = 4
+	// MEMBERSHIP_CHANGE_ADD 配置变更. add
+	MEMBERSHIP_CHANGE_ADD = 3
+	// MEMBERSHIP_CHANGE_REMOVE 配置变更. remove
+	MEMBERSHIP_CHANGE_REMOVE = 4
+	// 配置同步
+	MEMBERSHIP_CHANGE_SYNC = 5
 
+	// 客户端set请求类型
 	CLIENT_REQ_TYPE_SET = 10
+	// 客户端get请求
 	CLIENT_REQ_TYPE_GET = 11
 )
 
@@ -77,4 +81,24 @@ type ReqVoteParam struct {
 	LastLogTerm int64
 	// 请求人的地址 ip:port
 	ServiceId string
+}
+
+// 新节点ADD请求参数
+type MemberAddArgs struct {
+	/* 自身节点地址 */
+	PeerAddr string
+	/* 新的peers地址 ，需要所有节点更新为该地址集*/
+	NewPeerAddrs []string
+	/* 已知的最大的已经被提交的LogModule日志条目的索引值 */
+	CommitIndex int64
+}
+
+// server同步peers请求参数
+type SyncPeersArgs struct {
+	/* 新增的节点地址 */
+	PeerAddr string
+	/* 新的peers地址 ，需要所有节点更新为该地址集*/
+	NewPeerAddrs []string
+	/* 已知的最大的已经被提交的LogModule日志条目的索引值 */
+	CommitIndex int64
 }

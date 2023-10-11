@@ -29,3 +29,11 @@ type AppendResult struct {
 	Term    int64
 	Success bool
 }
+type MemberAddResult struct {
+	IsSuccess  bool
+	LeaderAddr string
+	Term       int64
+}
+type SyncPeersResult struct {
+	IsSuccess bool
+}
