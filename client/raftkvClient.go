@@ -28,7 +28,6 @@ func main() {
 
 func sendSetRequest(key string, value string) bool {
 
-	//TODO
 	for _, addr := range addrs {
 		request := &rpc.MyRequest{
 			RequestType:   rpc.CLIENT_REQ,

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"go-raftkv/common/rpc"
 
 	"github.com/spf13/cobra"
 )
@@ -10,18 +11,30 @@ var getCmd = &cobra.Command{
 	Use:   "get",
 	Short: "get the value of the key you input",
 	Long:  `get the value of the key you input`,
+	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		if args != nil {
-			if len(args) > 1 {
-				fmt.Printf("invaid command args")
+		key := args[0]
+		for _, addr := range addrs {
+			request := &rpc.MyRequest{
+				RequestType:   rpc.CLIENT_REQ,
+				ServiceId:     addr,
+				ServicePath:   "Node",
+				ServiceMethod: "HandlerClientRequest",
+				Args: &rpc.ClientRPCArgs{
+					Tp: rpc.CLIENT_REQ_TYPE_GET,
+					K:  key,
+				},
 			}
-
-			//TODO 通过临时创建client来get server的数据
-
-			return
-
-		} else {
-			fmt.Println("failed,please add a value behind the 'get'")
+			client := &rpc.RpcClient{}
+			reply := client.Send(request)
+			rpcReply := reply.(*rpc.ClientRPCReply)
+			if rpcReply.Success {
+				fmt.Printf("get successfully , the value of '%s' is : %s \n", key, rpcReply.Entry.V)
+				break
+			} else {
+				fmt.Println("get failed")
+				break
+			}
 		}
 	},
 }

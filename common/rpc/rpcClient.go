@@ -25,7 +25,6 @@ func (dc *RpcClient) SendWithTimeout(request *MyRequest, time time.Duration) Rep
 	xclient := client.NewXClient(request.ServicePath, client.Failtry, client.RandomSelect, d, option)
 	defer xclient.Close()
 	var replay Reply
-	// TODO 完善switch
 	switch request.RequestType {
 	case A_ENTRIES:
 		replay = &AppendResult{}

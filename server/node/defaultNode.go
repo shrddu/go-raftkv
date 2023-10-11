@@ -118,13 +118,9 @@ func (node *Node) Init() {
 	node.StateMachine = statemachine.GetInstance(node.Config.SelfPort)
 	node.Consensus = NewConsensus(node)
 
-	//TODO LinkedBlockingQueue 一个队列
-	//处理LinkedBlockingQueue中存储的的失败事件
-	//TODO ReplicationFailQueueConsumer 一个处理队列内失败任务的消费者
 	if lastEntry := node.Config.LogModule.GetLastEntry(); lastEntry != nil {
 		node.CurrentTerm = lastEntry.Term
 	}
-	// TODO 判断是否是新节点需要加入，发送请求
 	if node.Config.IsNewNode == "true" {
 		node.Config.PeerAddrs = append(node.Config.PeerAddrs, node.SelfAddr)
 		node.NewNodeNeedToDo()
