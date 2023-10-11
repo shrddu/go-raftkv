@@ -4,5 +4,5 @@ A distributed key value database based on raft protocol and rosedb. This project
 ## This project contains the following features:
 1. Support Raft protocol
 2. LogModule and StateMachine are based on rosedb
-3. Operate datebase with Terminal input (in future)
+3. Operate datebase with Terminal input based on cobra (in future)
 4. Available to add new node
