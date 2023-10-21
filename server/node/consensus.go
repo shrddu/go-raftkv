@@ -89,7 +89,9 @@ func (con *Consensus) HandlerRequestVote(args *any, reply *any) error {
 		con.Node.State = FOLLOWER
 		con.Node.LeaderAddr = reqVoteParam.ServiceId
 		con.Node.CurrentTerm = reqVoteParam.Term
-		con.Node.VotedFor = ""
+		con.Node.VotedFor = reqVoteParam.ServiceId
+		con.Node.PreElectionTime = time.Now().UnixMilli()
+		con.Node.PreHeartBeatTime = time.Now().UnixMilli()
 		reqVoteResult.IsVoted = true
 		reqVoteResult.Term = con.Node.CurrentTerm
 		return nil
@@ -166,12 +168,21 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 	}
 	// 情况2：真实日志 非空entries
 
+	// 特判如果是属于leader的becomeLeaderToDo方法中发送的仅更新termEntry的请求，仅需要更新本机termEntry即可
+	if (*appendEntriesArgs.Entries)[0].Index == 0 && len(*appendEntriesArgs.Entries) == 1 {
+		con.Node.Config.LogModule.Set(&(*appendEntriesArgs.Entries)[0])
+		appendResult.Success = true
+		appendResult.Term = con.Node.CurrentTerm
+		return nil
+	}
+
+	Log.Infof("node %s reveice a appendEntries %+v form leader %s ,entries : %+v", con.Node.SelfAddr, appendEntriesArgs, appendEntriesArgs.LeaderId, appendEntriesArgs.Entries)
 	// 两种失败的情况：term不对或者term对但index不对(前提是已经存在一些log)，都需要上层减小index重试
 	if con.Node.Config.LogModule.GetLastIndex() != 0 && appendEntriesArgs.PrevLogIndex != 0 {
 		entry := con.Node.Config.LogModule.Get(appendEntriesArgs.PrevLogIndex)
 		if entry != nil {
 			// index存在时即index相同，此时如果term不相同，说明不是同一条日志，需要返回错误，并且让上层减小preIndex重试，直到找到符合的日志
-			if entry.Term != appendEntriesArgs.Term {
+			if entry.Term != appendEntriesArgs.PreLogTerm {
 				appendResult.Success = false
 				appendResult.Term = con.Node.CurrentTerm
 				return nil
@@ -188,55 +199,64 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 
 	// 检测一下index相同但是term不同的情况：如果已经存在的日志条目和新的产生冲突（当前的preIndex+1已经存在entry了，索引值相同但是任期号不同），删除这一条和之后所有的.
 	// 作用是避免覆盖式写入或者正常写入后仍然存在尾部的"脏数据"，所以将符合index、term要求后面的log完全删除
-	uselessLog := con.Node.Config.LogModule.Get(appendEntriesArgs.PrevLogIndex + 1)
-	if uselessLog != nil {
-		if uselessLog.Term != (*appendEntriesArgs.Entries)[0].Term {
-			err := con.Node.Config.LogModule.DeleteOnStartIndex(appendEntriesArgs.PrevLogIndex + 1)
-			if err != nil {
-				Log.Error(err)
-				appendResult.Success = false
-				appendResult.Term = con.Node.CurrentTerm
-				return err
+	if (*appendEntriesArgs.Entries)[0].Index != 0 { // 防止更新termEntry(index==0)时误删log
+		uselessLog := con.Node.Config.LogModule.Get(appendEntriesArgs.PrevLogIndex + 1)
+		if uselessLog != nil {
+			if uselessLog.Term != (*appendEntriesArgs.Entries)[0].Term {
+				err := con.Node.Config.LogModule.DeleteOnStartIndex(appendEntriesArgs.PrevLogIndex + 1)
+				if err != nil {
+					Log.Error(err)
+					appendResult.Success = false
+					appendResult.Term = con.Node.CurrentTerm
+					return err
+				}
 			}
+			// 第一个日志的位置已经存在相同的log了，说明之前已经写过一次了，防止重复写入
+			Log.Infof("entries has been set into logModule , so appendEntries return true")
+			appendResult.Success = true
+			appendResult.Term = con.Node.CurrentTerm
+			return nil
 		}
-		// 第二个日志的位置已经存在相同的log了，说明之前已经写过一次了，防止重复写入
+		// 所以不符合条件的情况处理完成后
+		// 写进日志 ，这不是提交，所以commitIndex不用变，等下一次发来心跳时再更新commitIndex,也就是说当leader发现过半收到新日志时，会在下一次发布心跳时携带更新后的commitIndex让follower同步
+		for _, entry := range *appendEntriesArgs.Entries {
+			con.Node.Config.LogModule.Set(&entry)
+		}
+		// 更新node信息
+		// 下一个将要提交到状态机的日志的索引（如有）
+		nextCommit := con.Node.CommitIndex + 1
+		/*
+			此时进行了新增entry操作，需要更新一下commitIndex : min(lastIndex,leaderCommit) 这里只是更新一下新的LastIndex<LeaderCommit的情况，
+			而 LastIndex > leaderCommit的情况需要在leader统一提交时更新，也就是上边的那个相同操作
+		*/
+		// 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 当前日志的最后一个Index
+		if appendEntriesArgs.LeaderCommit > con.Node.CommitIndex {
+			floatMin := math.Min(float64(appendEntriesArgs.LeaderCommit), float64(con.Node.Config.LogModule.GetLastIndex()))
+			min := int64(floatMin)
+			con.Node.CommitIndex = min
+			con.Node.LastApplied = min
+		}
+		// 此处的nextCommit代表未更新之前的commit，如果更新后的commit大于他，就需要将nextCommit之前的提交。依次提交直到nextCommit等于commitIndex + 1
+		// 真正按照raft的原理应该不应该在这里直接提交，因为在这里就提交可能会无法处理leader的replication操作失败的情况，如果失败follower是不能提交的，可以等leader下次心跳时同步commit来判断是否需要提交;
+		// 不过如果leader心跳前挂了，但是replication操作已经成功一般时，那么就无法完成提交了，这是一种取舍。
+		// 在这种情况下即使提交了commitIndex前的数据，如果存在leader成功后但是宕机，也会有新的leader来更新，从而回退logModule，在之后新增log时也会更新掉stateMachine中的数据
+		for ; nextCommit <= con.Node.CommitIndex; nextCommit++ {
+			entry := con.Node.Config.LogModule.Get(nextCommit)
+			success := con.Node.StateMachine.Set(entry)
+			if success == false {
+				Log.Errorf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
+			}
+			nextCommit++
+		}
 		appendResult.Success = true
 		appendResult.Term = con.Node.CurrentTerm
+		con.Node.State = FOLLOWER
 		return nil
 	}
-	// 所以不符合条件的情况处理完成后
-	// 写进日志 ，这不是提交，所以commitIndex不用变，等下一次发来心跳时再更新commitIndex,也就是说当leader发现过半收到新日志时，会在下一次发布心跳时携带更新后的commitIndex让follower同步
-	for _, entry := range *appendEntriesArgs.Entries {
-		con.Node.Config.LogModule.Set(&entry)
-	}
-	// 更新node信息
-	// 下一个需要提交的日志的索引（如有）
-	nextCommit := con.Node.CommitIndex + 1
-	/*
-		此时进行了新增entry操作，需要更新一下commitIndex : min(lastIndex,leaderCommit) 这里只是更新一下新的LastIndex<LeaderCommit的情况，
-		而 LastIndex > leaderCommit的情况需要在leader统一提交时更新，也就是上边的那个相同操作
-	*/
-	// 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 当前日志的最后一个Index
-	if appendEntriesArgs.LeaderCommit > con.Node.CommitIndex {
-		floatMin := math.Min(float64(appendEntriesArgs.LeaderCommit), float64(con.Node.Config.LogModule.GetLastIndex()))
-		min := int64(floatMin)
-		con.Node.CommitIndex = min
-		con.Node.LastApplied = min
-	}
-	// 此处的nextCommit代表未更新之前的commit，如果更新后的commit大于他，就需要将nextCommit之前的提交。依次提交直到nextCommit等于commitIndex + 1
-	// 真正按照raft的原理应该不应该在这里直接提交，因为在这里就提交可能会无法处理leader的replication操作失败的情况，如果失败follower是不能提交的，可以等leader下次心跳时同步commit来判断是否需要提交;
-	// 不过如果leader心跳前挂了，但是replication操作已经成功一般时，那么就无法完成提交了，这是一种取舍。
-	// 在这种情况下即使提交了commitIndex前的数据，如果存在leader成功后但是宕机，也会有新的leader来更新，从而回退logModule，在之后新增log时也会更新掉stateMachine中的数据
-	for ; nextCommit <= con.Node.CommitIndex; nextCommit++ {
-		entry := con.Node.Config.LogModule.Get(nextCommit)
-		success := con.Node.StateMachine.Set(entry)
-		if success == false {
-			Log.Errorf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
-		}
-		nextCommit++
-	}
+	// 仅为了更新term的append
+	con.Node.Config.LogModule.Set(&(*appendEntriesArgs.Entries)[0])
+	con.Node.CurrentTerm = appendEntriesArgs.Term
 	appendResult.Success = true
 	appendResult.Term = con.Node.CurrentTerm
-	con.Node.State = FOLLOWER
 	return nil
 }

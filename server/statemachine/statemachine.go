@@ -10,6 +10,7 @@ import (
 	"sync"
 )
 
+// TODO 设置为相对地址
 var BasePath = "D:/GoStudy/GOPATH/src/go-raftkv/tmp/rosedb_basic/"
 var Log *zap.SugaredLogger
 
@@ -65,18 +66,18 @@ func (machine *StateMachine) Set(entry *rpc.LogEntry) bool {
 	keyBuf := &bytes.Buffer{}
 	entryBuf := &bytes.Buffer{}
 	if err := gob.NewEncoder(keyBuf).Encode(entry.K); err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return false
 	}
 	if err := gob.NewEncoder(entryBuf).Encode(entry); err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return false
 	}
 	err := machine.RSDB.Put(keyBuf.Bytes(), entryBuf.Bytes())
 	if err != nil {
 		panic(err)
 	}
-	Log.Infof("stateMachine : success to set a entry : %+v", entry)
+	Log.Infof("stateMachine : success to apply a entry : %+v", entry)
 	return true
 }
 

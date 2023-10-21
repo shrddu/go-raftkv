@@ -41,7 +41,7 @@ func (dc *RpcClient) SendWithTimeout(request *MyRequest, time time.Duration) Rep
 	case MEMBERSHIP_CHANGE_SYNC:
 		replay = &SyncPeersResult{}
 	}
-	Log.Infof("selfNode will send a '%s' type rpc , args :%+v", request.ServiceMethod, request.Args)
+	Log.Debugf("selfNode will send a '%s' type rpc , args :%+v", request.ServiceMethod, request.Args)
 	call, err := xclient.Go(context.Background(), request.ServiceMethod, request.Args, replay, nil)
 	if err != nil {
 		Log.Errorf("failed to send a %s type Request,error : %+v", request.ServiceMethod, err)
@@ -52,7 +52,7 @@ func (dc *RpcClient) SendWithTimeout(request *MyRequest, time time.Duration) Rep
 			Log.Fatalf("failed to call : %+v", replyCall.Error)
 		} else {
 			if replyCall.Reply != nil {
-				Log.Infof("success to call %s , the result contains : {args: %+v ,reply : %+v}", request.ServiceMethod, replyCall.Args, replyCall.Reply)
+				Log.Debugf("success to call %s , the result contains : {args: %+v ,reply : %+v}", request.ServiceMethod, replyCall.Args, replyCall.Reply)
 				return replyCall.Reply
 			} else {
 				Log.Warnf("send a %s type Request successfully,but get a empty reply from %s", request.ServiceMethod, request.ServiceId)

@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"encoding/gob"
+	"fmt"
 	"github.com/mitchellh/mapstructure"
 	"github.com/rosedblabs/rosedb/v2"
 	"github.com/smallnest/rpcx/server"
@@ -9,8 +11,11 @@ import (
 	"go-raftkv/common/rpc"
 	"go-raftkv/server/logmodule"
 	"go-raftkv/server/statemachine"
-	"math"
+	"os"
+	"os/signal"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -18,6 +23,8 @@ var (
 	LEADER    = 0
 	CANDIDATE = 1
 	FOLLOWER  = 2
+
+	exitChan chan os.Signal
 )
 
 /**
@@ -78,10 +85,10 @@ type Node struct {
 	/* ========== 在领导人里经常改变的(选举后重新初始化) ================== */
 
 	/** 对于每一个服务器，需要发送给他的下一个日志条目的索引值（初始化为领导人最后索引值加一） 不仅初始化时要设置，当follower变成leader时也需要重新设置*/
-	nextIndexs *map[string]int64 // map[serverAddr]nextIndex
+	nextIndexs *sync.Map // map[serverAddr]nextIndex
 
 	/** 对于每一个服务器，已经复制给他的日志的最高索引值 */
-	copiedIndexs *map[string]int64 // map[serverAddr]nextIndex
+	copiedIndexs *sync.Map // map[serverAddr]nextIndex
 	// 状态机
 	StateMachine *statemachine.StateMachine
 	/* 一致性模块 */
@@ -110,11 +117,12 @@ func (node *Node) Init() {
 	node.State = FOLLOWER
 	node.SelfAddr = "localhost:" + node.Config.SelfPort
 	node.IsRunning = true
+	node.nextIndexs = &sync.Map{}
+	node.copiedIndexs = &sync.Map{}
 	// 初始化剩余的config内容
 	node.Config.RpcClient = &rpc.RpcClient{}
 	node.Config.LogModule = node.getLogModuleInstance()
-	node.nextIndexs = &map[string]int64{}
-	node.copiedIndexs = &map[string]int64{}
+	node.initState()
 	node.StateMachine = statemachine.GetInstance(node.Config.SelfPort)
 	node.Consensus = NewConsensus(node)
 
@@ -133,6 +141,94 @@ func (node *Node) Init() {
 
 	Log.Infof("%s start success ...", node.SelfAddr)
 
+	// 在server端本地进行手动的set接口基准测试
+	/*
+		在13600k CPU (14核20线程) 测试条件下三次结果：
+		本次测试3s内set成功调用次数为：575
+		本次测试3s内set成功调用次数为：418
+		本次测试3s内set成功调用次数为：382
+
+		Set并发太低了，暂时不知道问题出在哪里，可能是测试方法不对？  :(
+	*/
+
+	//if node.Config.SelfPort == "9990" {
+	//	for i := 1; i <= 3; i++ {
+	//		go func() {
+	//			time.Sleep(5 * time.Second)
+	//			var count int64 = 0
+	//			start := time.Now().UnixMilli()
+	//			for {
+	//				end := time.Now().UnixMilli()
+	//				if end-start > 3*1000 {
+	//					break
+	//				}
+	//				go func() {
+	//					isSuccess := node.HandlerClientRequestWitchOnlyUsedByBenchmarkTest(&rpc.ClientRPCArgs{
+	//						Tp: rpc.CLIENT_REQ_TYPE_SET,
+	//						K:  "key1",
+	//						V:  "value1",
+	//					})
+	//					if isSuccess {
+	//						atomic.AddInt64(&count, 1)
+	//					}
+	//
+	//				}()
+	//			}
+	//			fmt.Printf("本次测试3s内set成功调用次数为：%d \n", atomic.LoadInt64(&count))
+	//		}()
+	//	}
+	//}
+
+	// 在server端本地进行手动的get接口基准测试
+	/*
+		在13600k CPU (14核20线程) 测试条件下三次结果：
+		本次测试3s内get成功调用次数为：254584
+		本次测试3s内get成功调用次数为：270167
+		本次测试3s内get成功调用次数为：260905
+	*/
+	//if node.Config.SelfPort == "9990" {
+	//	for i := 1; i <= 3; i++ {
+	//		go func() {
+	//			time.Sleep(10 * time.Second)
+	//			isSuccess := node.HandlerClientRequestWitchOnlyUsedByBenchmarkTest(&rpc.ClientRPCArgs{
+	//				Tp: rpc.CLIENT_REQ_TYPE_SET,
+	//				K:  "key1",
+	//				V:  "value1",
+	//			})
+	//			if isSuccess {
+	//				var count int64 = 0
+	//				start := time.Now().UnixMilli()
+	//				for {
+	//					end := time.Now().UnixMilli()
+	//					if end-start > 3*1000 {
+	//						break
+	//					}
+	//					go func() {
+	//						success := node.HandlerClientRequestWitchOnlyUsedByBenchmarkTest(&rpc.ClientRPCArgs{
+	//							Tp: rpc.CLIENT_REQ_TYPE_GET,
+	//							K:  "key1",
+	//							V:  "",
+	//						})
+	//						if success {
+	//							atomic.AddInt64(&count, 1)
+	//						}
+	//
+	//					}()
+	//				}
+	//				fmt.Printf("本次测试3s内get成功调用次数为：%d \n", atomic.LoadInt64(&count))
+	//			} else {
+	//				fmt.Println("set失败，get性能无法测试")
+	//			}
+	//
+	//		}()
+	//	}
+	//}
+
+	// 异常关闭时要储存state
+	exitChan = make(chan os.Signal)
+	signal.Notify(exitChan, os.Interrupt, os.Kill, syscall.SIGTERM)
+	go node.exitHandle()
+
 	// 所有配置初始化完成后注册server
 	s := server.NewServer()
 	err := s.Register(node, "")
@@ -143,8 +239,33 @@ func (node *Node) Init() {
 	if err != nil {
 		panic(err)
 	}
-
 }
+
+func (node *Node) initState() {
+	var storedState NodeState
+	file, err := os.Open(statemachine.BasePath + node.Config.SelfPort + "/nodeStateStore")
+	if err != nil {
+		Log.Warnln(err)
+		return
+	}
+	decoder := gob.NewDecoder(file)
+	err = decoder.Decode(&storedState)
+	if err != nil {
+		Log.Warnln(err)
+		return
+	}
+	Log.Infof("initState() get a state : %+v", storedState)
+	node.CommitIndex = storedState.CommitIndex
+	node.LastApplied = storedState.LastApplied
+	for k, v := range storedState.NextIndexs {
+		node.nextIndexs.LoadOrStore(k, v)
+	}
+	for k, v := range storedState.CopiedIndexs {
+		node.copiedIndexs.LoadOrStore(k, v)
+	}
+	return
+}
+
 func (node *Node) initTickerWork() {
 	// 启动心跳任务
 	go func(t *time.Ticker) {
@@ -267,7 +388,8 @@ func (node *Node) electionTask() {
 	param := &rpc.ReqVoteParam{
 		Term:         node.CurrentTerm,
 		LastLogIndex: lastLogIndex,
-		ServiceId:    node.SelfAddr,
+		// 不需要lastLogTerm这个无用的参数
+		ServiceId: node.SelfAddr,
 	}
 	if lastLogIndex == 0 && node.CurrentTerm == 0 {
 		param.Term = 0
@@ -422,16 +544,15 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 			Term:         node.CurrentTerm,
 			ServerId:     peer,
 			LeaderId:     node.LeaderAddr,
-			PrevLogIndex: int64(math.Max(float64(0), float64(entry.Index-1))),
-			PreLogTerm:   node.Config.LogModule.Get(int64(math.Max(float64(0), float64(entry.Index-1)))).Term,
 			Entries:      nil,
 			LeaderCommit: node.CommitIndex,
 		}
-		nextIndex := (*node.nextIndexs)[peer]
+		nextIndex_Any, _ := node.nextIndexs.LoadOrStore(peer, int64(1)) // 默认从1开始同步，因为0 index处是termEntry
+		nextIndex := nextIndex_Any.(int64)
 		var entries []rpc.LogEntry
 		// 2. 把entry前，nextIndex后的entries都发送过去
 		if entry.Index > nextIndex {
-			entries = make([]rpc.LogEntry, entry.Index-nextIndex)
+			entries = make([]rpc.LogEntry, (entry.Index-nextIndex)+1)
 			var j int = 0
 			for i := nextIndex; i <= entry.Index; i++ {
 				if value := node.Config.LogModule.Get(i); value != nil {
@@ -443,7 +564,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 			entries = make([]rpc.LogEntry, 1)
 			entries[0] = *entry
 		}
-		// entries前面的那一个
+		// entries前面一个(不是指entries的第一个)
 		preLog := node.getPreLog(entries[0])
 		args.PrevLogIndex = preLog.Index
 		args.PreLogTerm = preLog.Term
@@ -460,10 +581,13 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 			appendResult := reply.(*rpc.AppendResult)
 			if appendResult.Success {
 				Log.Infof("replication logEntry {%+v}from %s to %s now is success", entry, node.SelfAddr, peer)
-				(*node.nextIndexs)[peer] = entry.Index + 1
-				(*node.copiedIndexs)[peer] = entry.Index
+				if entry.Index != 0 {
+					node.nextIndexs.Store(peer, entry.Index+1)
+					node.copiedIndexs.Store(peer, entry.Index)
+				}
 				return true
 			} else {
+				Log.Infof("replication's successValue which form %s to %s  is false")
 				// 分析原因
 				// 1. 对方周期大于自己
 				if appendResult.Term > node.CurrentTerm {
@@ -477,7 +601,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 					if nextIndex == 0 {
 						nextIndex = 1
 					}
-					(*node.nextIndexs)[peer] = nextIndex - 1
+					node.nextIndexs.Store(peer, nextIndex-1)
 					// 本次循环结束，在超时范围内自动重试
 				}
 
@@ -494,18 +618,50 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 func (node *Node) getPreLog(entry rpc.LogEntry) *rpc.LogEntry {
 	preLog := node.Config.LogModule.Get(entry.Index - 1)
 	if preLog == nil {
-		Log.Warnf("get a preLog before %+v is empty", entry)
 		preLog = &rpc.LogEntry{
 			Index: 0,
-			Term:  0,
+			Term:  entry.Term, //TODO 到底该返回什么？
 			K:     "",
 			V:     "",
 		}
+		Log.Warnf("get a preLog before %+v is null , so return a index[0] entry : %+v", entry, preLog)
 	}
 	return preLog
 }
 func (node *Node) Destroy() {
+	node.Persistence()
 	node.Config.RpcClient.Destroy()
+	node.Config.LogModule.Destroy()
+	node.StateMachine.Destroy()
+}
+
+func (node *Node) Persistence() {
+	var nextIndexs = make(map[string]int64)
+	var copiedIndexs = make(map[string]int64)
+	node.nextIndexs.Range(func(key, value any) bool {
+		nextIndexs[key.(string)] = value.(int64)
+		return true
+	})
+	node.copiedIndexs.Range(func(key, value any) bool {
+		copiedIndexs[key.(string)] = value.(int64)
+		return true
+	})
+	state := &NodeState{
+		CommitIndex:  node.CommitIndex,
+		LastApplied:  node.LastApplied,
+		NextIndexs:   nextIndexs,
+		CopiedIndexs: copiedIndexs,
+	}
+	file, err := os.Create(statemachine.BasePath + node.Config.SelfPort + "/nodeStateStore")
+	if err != nil {
+		Log.Warnln(err)
+	}
+	encoder := gob.NewEncoder(file)
+	err = encoder.Encode(state)
+	if err != nil {
+		Log.Warnln(err)
+	}
+	Log.Infof("NodeState persistece successful, state : %+v ", state)
 }
 
 // HandlerClientRequest
@@ -616,10 +772,90 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 			}
 		}
 	}
+	Log.Infof("HandlerClientRequest end but not within expectations")
 	replyStruct.Success = false
 	return nil
 }
+func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *rpc.ClientRPCArgs) bool {
 
+	Log.Infof("Get a ClientRequest ,args:%+v", argsStruct) //将指针指向的interface 取反得到interface类型，这样就可以正常通过%v来输出他的值了
+	//rpcArgs := (args).(rpc.ClientRPCArgs) //将指针指向的interface自动转换为指定类型时，会掉进golang自动转换的陷阱，不要用这种方法来转换
+
+	/*进行业务操作*/
+	Log.Infof("HandlerClientRequest Method get a client request : %+v ", argsStruct)
+	if node.State != LEADER {
+		Log.Warnf("node %s get a clientRequest,but not a leader ,redirect to leader %s", node.SelfAddr, node.LeaderAddr)
+		return false
+	}
+	// GET
+	if argsStruct.Tp == rpc.CLIENT_REQ_TYPE_GET {
+		entry := node.StateMachine.Get(argsStruct.K)
+		if entry != nil {
+			return true
+		} else {
+			return false
+		}
+	}
+	// SET
+	logEntry := &rpc.LogEntry{
+		Index: node.Config.LogModule.GetLastIndex() + 1,
+		Term:  node.CurrentTerm,
+		K:     argsStruct.K,
+		V:     argsStruct.V,
+	}
+	// 预提交，如果成功大于一半，就应用到状态机，否则删除该log之后的所有内容，从而回滚
+	node.Config.LogModule.Set(logEntry)
+	Log.Infof("PRE-COMMIT: write a entry{%+v} into node %s's logModule", logEntry, node.SelfAddr)
+	// 复制到其他节点，观察成功数占比
+	peers := node.getPeerAddrsWithOutSelf()
+	var count int64 = 0
+	var sendedCount int64 = 0
+	var isChannelClosed int64 = 0
+	c := make(chan bool, len(peers))
+	defer close(c)
+	for _, peer := range peers {
+		peer := peer
+		go func() {
+			isSuccess := node.replication(peer, logEntry)
+			if isSuccess {
+				if atomic.LoadInt64(&isChannelClosed) == 0 {
+					c <- true
+				}
+			} else {
+				if atomic.LoadInt64(&isChannelClosed) == 0 {
+					c <- false
+				}
+			}
+		}()
+	}
+	for msg := range c {
+		atomic.AddInt64(&sendedCount, 1)
+		if msg {
+			atomic.AddInt64(&count, 1)
+			if count >= (int64)(len(peers)/2) {
+				// 复制成功，提交log到stateMachine，并更新相关信息
+				node.CommitIndex = logEntry.Index
+				node.StateMachine.Set(logEntry)
+				node.LastApplied = node.CommitIndex
+				Log.Infof("success apply stateMachine, logEntry info : {%+v}", logEntry)
+				atomic.AddInt64(&isChannelClosed, 1)
+				return true
+			}
+		} else {
+			if sendedCount == int64(len(peers)) {
+				// 一半以上没接收到，需要回滚
+				Log.Warnf("node %s fail apply statMachine entry:{%+v}", node.SelfAddr, logEntry)
+				err := node.Config.LogModule.DeleteOnStartIndex(logEntry.Index)
+				if err != nil {
+					return false
+				}
+				return true
+			}
+		}
+	}
+	Log.Infof("end but not within expectations")
+	return false
+}
 func (node *Node) HandlerRequestVote(ctx context.Context, args *any, reply *any) error {
 	return node.Consensus.HandlerRequestVote(args, reply)
 }
@@ -676,8 +912,8 @@ func (node *Node) HandlerMemberAdd(ctx context.Context, args *any, reply *any) e
 	if syncSuccessCount == len(peers) {
 		// 同步成功
 		node.Config.PeerAddrs = memberAddArgs.NewPeerAddrs
-		(*node.nextIndexs)[memberAddArgs.PeerAddr] = memberAddArgs.CommitIndex + 1
-		(*node.copiedIndexs)[memberAddArgs.PeerAddr] = memberAddArgs.CommitIndex
+		node.nextIndexs.Store(memberAddArgs.PeerAddr, memberAddArgs.CommitIndex+1)
+		node.copiedIndexs.Store(memberAddArgs.PeerAddr, memberAddArgs.CommitIndex)
 		memberAddResult.IsSuccess = true
 		memberAddResult.Term = node.CurrentTerm
 		memberAddResult.LeaderAddr = node.LeaderAddr
@@ -711,8 +947,8 @@ func (node *Node) HandlerMemberChangeSync(ctx context.Context, args *any, reply 
 	}()
 
 	node.Config.PeerAddrs = syncPeersArgs.NewPeerAddrs
-	(*node.nextIndexs)[syncPeersArgs.PeerAddr] = syncPeersArgs.CommitIndex + 1
-	(*node.copiedIndexs)[syncPeersArgs.PeerAddr] = syncPeersArgs.CommitIndex
+	node.nextIndexs.Store(syncPeersArgs.PeerAddr, syncPeersArgs.CommitIndex+1)
+	node.copiedIndexs.Store(syncPeersArgs.PeerAddr, syncPeersArgs.CommitIndex)
 	// 更改结束
 	syncPeersResult.IsSuccess = true
 	return nil
@@ -758,4 +994,11 @@ func (node *Node) NewNodeNeedToDo() {
 			}
 		}
 	}
+}
+
+func (node *Node) exitHandle() {
+	s := <-exitChan
+	fmt.Println("收到退出信号", s)
+	node.Destroy()
+	os.Exit(1) //如果ctrl+c 关不掉程序，使用os.Exit强行关掉
 }

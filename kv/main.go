@@ -17,6 +17,7 @@ package main
 
 import "go-raftkv/kv/cmd"
 
+/* 需要手动 go install 此程序为exe文件到 GOPATH/bin 目录下，这样就可以在 terminal 里用 (kv set key111 value111 或者kv get key111) 来操作数据库 */
 func main() {
 	cmd.Execute()
 }

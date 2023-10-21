@@ -39,7 +39,11 @@ func (module *LogModule) Destroy() {
 //	@receiver module
 //	@param entry
 func (module *LogModule) Set(entry *rpc.LogEntry) {
-	module.lock.Lock()
+	if !module.lock.TryLock() {
+		Log.Infof("logmodule get MutexLock failed ,set operation is failed")
+		return
+	}
+	defer module.lock.Unlock()
 	/*write方法中的data参数如果是结构体，那么结构体里不能有string类型。因为string是不定长类型，不支持string
 	  所以选择使用gob包来编解码结构体，参考：https://blog.csdn.net/weixin_41896770/article/details/128152614
 	*/
@@ -61,8 +65,11 @@ func (module *LogModule) Set(entry *rpc.LogEntry) {
 		return
 	}
 	Log.Infof("logmodule write success : %+v", entry)
-	module.UpdateLastIndex(entry.Index)
-	module.lock.Unlock()
+	if entry.Index != 0 {
+		module.UpdateLastIndex(entry.Index)
+	} else if module.GetLastIndex() == 0 {
+		module.UpdateLastIndex(0)
+	}
 }
 
 // Get
@@ -75,21 +82,21 @@ func (module *LogModule) Get(index int64) *rpc.LogEntry {
 	indexBuf := new(bytes.Buffer)
 	indexString := strconv.FormatInt(index, 10)
 	if err := gob.NewEncoder(indexBuf).Encode(indexString); err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return nil
 	}
 	value, err := module.DB.Get(indexBuf.Bytes())
 	if err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return nil
 	}
 	valueBuf := bytes.NewBuffer(value)
 	entry := &rpc.LogEntry{}
 	if err := gob.NewDecoder(valueBuf).Decode(entry); err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return nil
 	}
-	Log.Infof("read a entry %+v", entry)
+	Log.Infof("logModule read a entry %+v", entry)
 	//u := binary.LittleEndian.Uint64(value)
 	return entry
 }
@@ -125,18 +132,18 @@ func (module *LogModule) DeleteOnStartIndex(startIndex int64) error {
 func (module *LogModule) GetLastIndex() int64 {
 	value, err := module.DB.Get([]byte(LAST_INDEX_KEY))
 	if err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return 0
 	}
 	lastIndex := bytesToInt64(value)
-	Log.Infof("get lastIndex %d", lastIndex)
+	Log.Infof("get lastIndex : %d", lastIndex)
 	return lastIndex
 }
 
 func (module *LogModule) GetLastEntry() *rpc.LogEntry {
 	value, err := module.DB.Get([]byte(LAST_INDEX_KEY))
 	if err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return nil
 	}
 	index := bytesToInt64(value)
@@ -154,7 +161,7 @@ func (module *LogModule) UpdateLastIndex(index int64) {
 	bts := int64ToBytes(index)
 	// int64转string 存储的类型是:  K:string V:string
 	if err := module.DB.Put([]byte(LAST_INDEX_KEY), bts); err != nil {
-		Log.Warn(err)
+		Log.Debug(err)
 		return
 	}
 	Log.Infof("'LastIndex' update to %d success", index)
