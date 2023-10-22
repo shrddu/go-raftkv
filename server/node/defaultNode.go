@@ -41,7 +41,7 @@ var (
 //
 // @Note : 属性中时间的单位都是毫秒
 type Node struct {
-	// 配置selfport 和 peerAddrs
+	// 配置selfPort 和 peerAddrs
 	Config *Config
 
 	// 选举时间超时限制
@@ -77,10 +77,10 @@ type Node struct {
 	/* ============ 所有服务器上经常变的 ============= */
 
 	/** 已知的最大的已经被提交的LogModule日志条目的索引值 */
-	CommitIndex int64
+	CommitIndex int64 // atomic
 
 	/** 最后被应用到状态机的日志条目索引值（初始化为 0，持续递增) */
-	LastApplied int64
+	LastApplied int64 // atomic
 
 	/* ========== 在领导人里经常改变的(选举后重新初始化) ================== */
 
@@ -181,36 +181,40 @@ func (node *Node) Init() {
 
 	// 在server端本地进行手动单机的set接口基准测试
 	/*
-		测试结果：
+		在13600k CPU (14核20线程) 测试条件下三次结果：
+
+		本次测试3s内set成功调用次数为：77807
+		本次测试3s内set成功调用次数为：78633
+		本次测试3s内set成功调用次数为：72726
 	*/
 
-	if node.Config.SelfPort == "9990" {
-		for i := 1; i <= 3; i++ {
-			go func() {
-				time.Sleep(5 * time.Second)
-				var count int64 = 0
-				start := time.Now().UnixMilli()
-				for {
-					end := time.Now().UnixMilli()
-					if end-start > 3*1000 {
-						break
-					}
-					go func() {
-						isSuccess := node.HandlerClientRequestAloneMode(&rpc.ClientRPCArgs{
-							Tp: rpc.CLIENT_REQ_TYPE_SET,
-							K:  "key1",
-							V:  "value1",
-						})
-						if isSuccess {
-							atomic.AddInt64(&count, 1)
-						}
-
-					}()
-				}
-				fmt.Printf("本次测试3s内set成功调用次数为：%d \n", atomic.LoadInt64(&count))
-			}()
-		}
-	}
+	//if node.Config.SelfPort == "9990" {
+	//	for i := 1; i <= 3; i++ {
+	//		go func() {
+	//			time.Sleep(5 * time.Second)
+	//			var count int64 = 0
+	//			start := time.Now().UnixMilli()
+	//			for {
+	//				end := time.Now().UnixMilli()
+	//				if end-start > 3*1000 {
+	//					break
+	//				}
+	//				go func() {
+	//					isSuccess := node.HandlerClientRequestAloneMode(&rpc.ClientRPCArgs{
+	//						Tp: rpc.CLIENT_REQ_TYPE_SET,
+	//						K:  "key1",
+	//						V:  "value1",
+	//					})
+	//					if isSuccess {
+	//						atomic.AddInt64(&count, 1)
+	//					}
+	//
+	//				}()
+	//			}
+	//			fmt.Printf("本次测试3s内set成功调用次数为：%d \n", atomic.LoadInt64(&count))
+	//		}()
+	//	}
+	//}
 
 	// 在server端本地进行手动的get接口基准测试
 	/*
@@ -288,8 +292,8 @@ func (node *Node) initState() {
 		return
 	}
 	Log.Infof("initState() get a state : %+v", storedState)
-	node.CommitIndex = storedState.CommitIndex
-	node.LastApplied = storedState.LastApplied
+	atomic.StoreInt64(&node.CommitIndex, storedState.CommitIndex)
+	atomic.StoreInt64(&node.LastApplied, storedState.LastApplied)
 	for k, v := range storedState.NextIndexs {
 		node.nextIndexs.LoadOrStore(k, v)
 	}
@@ -355,7 +359,7 @@ func (node *Node) heartBeatTask() {
 			ServerId:     peer,
 			LeaderId:     node.SelfAddr,
 			Entries:      nil,
-			LeaderCommit: node.CommitIndex,
+			LeaderCommit: atomic.LoadInt64(&node.CommitIndex),
 		}
 		request := &rpc.MyRequest{
 			RequestType:   rpc.A_ENTRIES,
@@ -427,7 +431,12 @@ func (node *Node) electionTask() {
 	if lastLogIndex == 0 && node.CurrentTerm == 0 {
 		param.Term = 0
 	} else {
-		param.Term = node.Config.LogModule.Get(lastLogIndex).Term
+		entry := node.Config.LogModule.Get(lastLogIndex)
+		if entry != nil {
+			param.Term = node.Config.LogModule.Get(lastLogIndex).Term
+		} else {
+			return
+		}
 	}
 	c := make(chan bool, len(peers))
 	var isChannelClosed int64 = 0
@@ -466,7 +475,7 @@ func (node *Node) electionTask() {
 		}()
 	}
 	var votedCount int64 = 0
-	var sendedCount int64 = 0
+	var sentCount int64 = 0
 	// 3. 监听结果，如果半数以上同意则自己term自增1，设置自己为leader
 	for msg := range c {
 		switch msg {
@@ -476,7 +485,7 @@ func (node *Node) electionTask() {
 				return
 			}
 			atomic.AddInt64(&votedCount, 1)
-			atomic.AddInt64(&sendedCount, 1)
+			atomic.AddInt64(&sentCount, 1)
 			if votedCount >= (int64)(len(peers)/2) {
 				// 公投成功
 				node.State = LEADER
@@ -491,11 +500,11 @@ func (node *Node) electionTask() {
 		case false:
 			{
 				Log.Warnf("electionTask : listening a 'false' msg from channel")
-				atomic.AddInt64(&sendedCount, 1)
+				atomic.AddInt64(&sentCount, 1)
 				break
 			}
 		}
-		if sendedCount == int64(len(peers)) || node.State == LEADER {
+		if sentCount == int64(len(peers)) || node.State == LEADER {
 			atomic.AddInt64(&isChannelClosed, 1)
 			break
 		}
@@ -559,7 +568,7 @@ func (node *Node) becomeLeaderToDo() {
 			}
 		}
 		if receivedCount == int64(len(peers)) {
-			Log.Warnf("fail to update peers' new term , leader : %s ,term : %s", node.SelfAddr, node.CurrentTerm)
+			Log.Warnf("fail to update peers' new term , leader : %s ,term : %d", node.SelfAddr, node.CurrentTerm)
 			// 没有更新到所有follower，成为leader的行为失败，当前term失效，设置自己为candidate
 			node.State = FOLLOWER
 			atomic.AddInt64(&channelIsClosed, 1)
@@ -578,15 +587,15 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 			ServerId:     peer,
 			LeaderId:     node.LeaderAddr,
 			Entries:      nil,
-			LeaderCommit: node.CommitIndex,
+			LeaderCommit: atomic.LoadInt64(&node.CommitIndex),
 		}
-		nextIndex_Any, _ := node.nextIndexs.LoadOrStore(peer, int64(1)) // 默认从1开始同步，因为0 index处是termEntry
-		nextIndex := nextIndex_Any.(int64)
+		nextIndexAny, _ := node.nextIndexs.LoadOrStore(peer, int64(1)) // 默认从1开始同步，因为0 index处是termEntry
+		nextIndex := nextIndexAny.(int64)
 		var entries []rpc.LogEntry
 		// 2. 把entry前，nextIndex后的entries都发送过去
 		if entry.Index > nextIndex {
 			entries = make([]rpc.LogEntry, (entry.Index-nextIndex)+1)
-			var j int = 0
+			var j = 0
 			for i := nextIndex; i <= entry.Index; i++ {
 				if value := node.Config.LogModule.Get(i); value != nil {
 					entries[j] = *value
@@ -620,7 +629,7 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 				}
 				return true
 			} else {
-				Log.Infof("replication's successValue which form %s to %s  is false")
+				Log.Infof("replication's successValue which form %s to %s  is false", node.SelfAddr, peer)
 				// 分析原因
 				// 1. 对方周期大于自己
 				if appendResult.Term > node.CurrentTerm {
@@ -649,15 +658,26 @@ func (node *Node) replication(peer string, entry *rpc.LogEntry) bool {
 }
 
 func (node *Node) getPreLog(entry rpc.LogEntry) *rpc.LogEntry {
-	preLog := node.Config.LogModule.Get(entry.Index - 1)
-	if preLog == nil {
-		preLog = &rpc.LogEntry{
-			Index: 0,
-			Term:  entry.Term, //TODO 到底该返回什么？
-			K:     "",
-			V:     "",
+	if entry.Index == 0 {
+		Log.Warnf("getPreLog : entry is termEntry ,so return termEntry itself")
+		return &entry
+	}
+	for ; entry.Index-1 != 0; entry.Index-- {
+		preLog := node.Config.LogModule.Get(entry.Index - 1)
+		if preLog != nil {
+			Log.Infof("get a preLog before { %+v } : %+v", entry, preLog)
+			return preLog
+
+		} else {
+			Log.Infof("get a preLog before { %+v } is nil , so try to reduce one of entry.Index to get a preLog before now nil preLog")
 		}
-		Log.Warnf("get a preLog before %+v is null , so return a index[0] entry : %+v", entry, preLog)
+	}
+	// index减到第一条非term日志,直接返回一个TermEntry
+	preLog := &rpc.LogEntry{
+		Index: 0,
+		Term:  node.CurrentTerm,
+		K:     "",
+		V:     "",
 	}
 	return preLog
 }
@@ -680,8 +700,8 @@ func (node *Node) Persistence() {
 		return true
 	})
 	state := &NodeState{
-		CommitIndex:  node.CommitIndex,
-		LastApplied:  node.LastApplied,
+		CommitIndex:  atomic.LoadInt64(&node.CommitIndex),
+		LastApplied:  atomic.LoadInt64(&node.LastApplied),
 		NextIndexs:   nextIndexs,
 		CopiedIndexs: copiedIndexs,
 	}
@@ -749,7 +769,7 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 	}
 	// SET
 	logEntry := &rpc.LogEntry{
-		Index: node.Config.LogModule.GetLastIndex() + 1,
+		Index: atomic.AddInt64(&node.CommitIndex, 1),
 		Term:  node.CurrentTerm,
 		K:     argsStruct.K,
 		V:     argsStruct.V,
@@ -760,7 +780,7 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 	// 复制到其他节点，观察成功数占比
 	peers := node.getPeerAddrsWithOutSelf()
 	var count int64 = 0
-	var sendedCount int64 = 0
+	var sentCount int64 = 0
 	var isChannelClosed int64 = 0
 	c := make(chan bool, len(peers))
 	defer close(c)
@@ -780,14 +800,13 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 		}()
 	}
 	for msg := range c {
-		atomic.AddInt64(&sendedCount, 1)
+		atomic.AddInt64(&sentCount, 1)
 		if msg {
 			atomic.AddInt64(&count, 1)
 			if count >= (int64)(len(peers)/2) {
 				// 复制成功，提交log到stateMachine，并更新相关信息
-				node.CommitIndex = logEntry.Index
 				node.StateMachine.Set(logEntry)
-				node.LastApplied = node.CommitIndex
+				atomic.AddInt64(&node.LastApplied, 1)
 				Log.Infof("success apply stateMachine, logEntry info : {%+v}", logEntry)
 				replyStruct.Success = true
 				replyStruct.Entry = *logEntry
@@ -795,10 +814,10 @@ func (node *Node) HandlerClientRequest(ctx context.Context, args *any, reply *an
 				return nil
 			}
 		} else {
-			if sendedCount == int64(len(peers)) {
+			if sentCount == int64(len(peers)) {
 				// 一半以上没接收到，需要回滚
 				Log.Warnf("node %s fail apply statMachine entry:{%+v}", node.SelfAddr, logEntry)
-				err := node.Config.LogModule.DeleteOnStartIndex(logEntry.Index)
+				err := node.Config.LogModule.Delete(logEntry.Index)
 				replyStruct.Success = false
 				replyStruct.Entry = *logEntry
 				return err
@@ -831,7 +850,7 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 	}
 	// SET
 	logEntry := &rpc.LogEntry{
-		Index: node.Config.LogModule.GetLastIndex() + 1,
+		Index: atomic.AddInt64(&node.CommitIndex, 1),
 		Term:  node.CurrentTerm,
 		K:     argsStruct.K,
 		V:     argsStruct.V,
@@ -842,7 +861,7 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 	// 复制到其他节点，观察成功数占比
 	peers := node.getPeerAddrsWithOutSelf()
 	var count int64 = 0
-	var sendedCount int64 = 0
+	var sentCount int64 = 0
 	var isChannelClosed int64 = 0
 	c := make(chan bool, len(peers))
 	defer close(c)
@@ -862,23 +881,22 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 		}()
 	}
 	for msg := range c {
-		atomic.AddInt64(&sendedCount, 1)
+		atomic.AddInt64(&sentCount, 1)
 		if msg {
 			atomic.AddInt64(&count, 1)
 			if count >= (int64)(len(peers)/2) {
 				// 复制成功，提交log到stateMachine，并更新相关信息
-				node.CommitIndex = logEntry.Index
 				node.StateMachine.Set(logEntry)
-				node.LastApplied = node.CommitIndex
+				atomic.AddInt64(&node.LastApplied, 1)
 				Log.Infof("success apply stateMachine, logEntry info : {%+v}", logEntry)
 				atomic.AddInt64(&isChannelClosed, 1)
 				return true
 			}
 		} else {
-			if sendedCount == int64(len(peers)) {
+			if sentCount == int64(len(peers)) {
 				// 一半以上没接收到，需要回滚
 				Log.Warnf("node %s fail apply statMachine entry:{%+v}", node.SelfAddr, logEntry)
-				err := node.Config.LogModule.DeleteOnStartIndex(logEntry.Index)
+				err := node.Config.LogModule.Delete(logEntry.Index)
 				if err != nil {
 					return false
 				}
@@ -892,7 +910,7 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 
 func (node *Node) HandlerClientRequestAloneMode(argsStruct *rpc.ClientRPCArgs) bool {
 	entry := &rpc.LogEntry{
-		Index: node.CommitIndex + 1,
+		Index: atomic.AddInt64(&node.CommitIndex, 1),
 		Term:  1,
 		K:     argsStruct.K,
 		V:     argsStruct.V,
@@ -900,7 +918,6 @@ func (node *Node) HandlerClientRequestAloneMode(argsStruct *rpc.ClientRPCArgs) b
 	node.Config.LogModule.Set(entry)
 	success := node.StateMachine.Set(entry)
 	if success {
-		node.CommitIndex += 1
 		return true
 	}
 	return false
@@ -934,7 +951,7 @@ func (node *Node) HandlerMemberAdd(ctx context.Context, args *any, reply *any) e
 	}()
 	Log.Infof("%s get a HandlerMemberAdd request ,args : %+v ", node.SelfAddr, memberAddArgs)
 	peers := node.getPeerAddrsWithOutSelf()
-	var syncSuccessCount int = 0
+	var syncSuccessCount = 0
 	for _, peer := range peers {
 		args := &rpc.SyncPeersArgs{
 			PeerAddr:     memberAddArgs.PeerAddr,
@@ -1021,7 +1038,7 @@ func (node *Node) NewNodeNeedToDo() {
 		args := &rpc.MemberAddArgs{
 			PeerAddr:     node.SelfAddr,
 			NewPeerAddrs: node.Config.PeerAddrs,
-			CommitIndex:  node.CommitIndex,
+			CommitIndex:  atomic.LoadInt64(&node.CommitIndex),
 		}
 		request := &rpc.MyRequest{
 			RequestType:   rpc.MEMBERSHIP_CHANGE_ADD,

@@ -86,7 +86,7 @@ func (module *LogModule) Get(index int64) *rpc.LogEntry {
 		return nil
 	}
 	value, err := module.DB.Get(indexBuf.Bytes())
-	if err != nil {
+	if err != nil || value == nil {
 		Log.Debug(err)
 		return nil
 	}
@@ -99,6 +99,20 @@ func (module *LogModule) Get(index int64) *rpc.LogEntry {
 	Log.Infof("logModule read a entry %+v", entry)
 	//u := binary.LittleEndian.Uint64(value)
 	return entry
+}
+func (module *LogModule) Delete(index int64) error {
+	indexBuf := &bytes.Buffer{}
+	indexString := strconv.FormatInt(index, 10)
+	if err := gob.NewEncoder(indexBuf).Encode(indexString); err != nil {
+		return err
+	}
+	err := module.DB.Delete(indexBuf.Bytes())
+	if err != nil {
+		Log.Errorf("delete entry which index is : %d failed", index)
+		return err
+	}
+	Log.Infof("delete entry which index is : %d success", index)
+	return nil
 }
 
 // DeleteOnStartIndex

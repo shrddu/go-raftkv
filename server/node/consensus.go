@@ -15,6 +15,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -144,22 +145,26 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 	if appendEntriesArgs.Entries == nil || len(*appendEntriesArgs.Entries) == 0 {
 		Log.Infof("node %s reveice a heartbeat form leader %s ", con.Node.SelfAddr, appendEntriesArgs.LeaderId)
 
-		nextCommit := con.Node.CommitIndex + 1
+		nextCommit := atomic.LoadInt64(&con.Node.CommitIndex) + 1
 		//如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 当前日志的最后一个Index
 		// 意思就是当leaderCommit大于commitIndex时，就需要提交当前logModule中存在的所有log
-		if appendEntriesArgs.LeaderCommit > con.Node.CommitIndex {
+		if appendEntriesArgs.LeaderCommit > atomic.LoadInt64(&con.Node.CommitIndex) {
 			floatMin := math.Min(float64(appendEntriesArgs.LeaderCommit), float64(con.Node.Config.LogModule.GetLastIndex()))
 			min := int64(floatMin)
-			con.Node.CommitIndex = min
-			con.Node.LastApplied = min
+			atomic.StoreInt64(&con.Node.CommitIndex, min)
+			atomic.StoreInt64(&con.Node.LastApplied, min)
 		}
 		// 更新之后的commitIndex如果大于下个要插入的位置，那就直接把nextCommit到commitIndex之间的所有log提交到状态机
-		for ; nextCommit <= con.Node.CommitIndex; nextCommit++ {
-			if success := con.Node.StateMachine.Set(con.Node.Config.LogModule.Get(nextCommit)); success {
-				Log.Infof("node %s apply a entry to stateMachine successfully", con.Node.SelfAddr)
-			} else {
-				Log.Errorf("node %s apply a entry to stateMachine failed", con.Node.SelfAddr)
+		for ; nextCommit <= atomic.LoadInt64(&con.Node.CommitIndex); nextCommit++ {
+			entry := con.Node.Config.LogModule.Get(nextCommit)
+			if entry != nil {
+				if success := con.Node.StateMachine.Set(entry); success {
+					Log.Infof("node %s apply a entry to stateMachine successfully", con.Node.SelfAddr)
+				} else {
+					Log.Errorf("node %s apply a entry to stateMachine failed", con.Node.SelfAddr)
+				}
 			}
+
 		}
 		Log.Infof("node %s handler a heartbeat from %s successfully", con.Node.SelfAddr, appendEntriesArgs.LeaderId)
 		appendResult.Success = true
@@ -224,27 +229,31 @@ func (con *Consensus) HandlerAppendEntries(args *any, reply *any) error {
 		}
 		// 更新node信息
 		// 下一个将要提交到状态机的日志的索引（如有）
-		nextCommit := con.Node.CommitIndex + 1
+		nextCommit := atomic.LoadInt64(&con.Node.CommitIndex) + 1
 		/*
 			此时进行了新增entry操作，需要更新一下commitIndex : min(lastIndex,leaderCommit) 这里只是更新一下新的LastIndex<LeaderCommit的情况，
 			而 LastIndex > leaderCommit的情况需要在leader统一提交时更新，也就是上边的那个相同操作
 		*/
 		// 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 当前日志的最后一个Index
-		if appendEntriesArgs.LeaderCommit > con.Node.CommitIndex {
+		if appendEntriesArgs.LeaderCommit > atomic.LoadInt64(&con.Node.CommitIndex) {
 			floatMin := math.Min(float64(appendEntriesArgs.LeaderCommit), float64(con.Node.Config.LogModule.GetLastIndex()))
 			min := int64(floatMin)
-			con.Node.CommitIndex = min
-			con.Node.LastApplied = min
+			atomic.StoreInt64(&con.Node.CommitIndex, min)
+			atomic.StoreInt64(&con.Node.LastApplied, min)
 		}
 		// 此处的nextCommit代表未更新之前的commit，如果更新后的commit大于他，就需要将nextCommit之前的提交。依次提交直到nextCommit等于commitIndex + 1
 		// 真正按照raft的原理应该不应该在这里直接提交，因为在这里就提交可能会无法处理leader的replication操作失败的情况，如果失败follower是不能提交的，可以等leader下次心跳时同步commit来判断是否需要提交;
 		// 不过如果leader心跳前挂了，但是replication操作已经成功一般时，那么就无法完成提交了，这是一种取舍。
 		// 在这种情况下即使提交了commitIndex前的数据，如果存在leader成功后但是宕机，也会有新的leader来更新，从而回退logModule，在之后新增log时也会更新掉stateMachine中的数据
-		for ; nextCommit <= con.Node.CommitIndex; nextCommit++ {
+		for ; nextCommit <= atomic.LoadInt64(&con.Node.CommitIndex); nextCommit++ {
 			entry := con.Node.Config.LogModule.Get(nextCommit)
-			success := con.Node.StateMachine.Set(entry)
-			if success == false {
-				Log.Errorf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
+			if entry != nil {
+				success := con.Node.StateMachine.Set(entry)
+				if success {
+					Log.Infof("node %s apply a entry to stateMachine successfully", con.Node.SelfAddr)
+				} else {
+					Log.Errorf("node %s apply logEntry{%+v} to stateMachine failed", con.Node.SelfAddr, entry)
+				}
 			}
 			nextCommit++
 		}

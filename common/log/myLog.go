@@ -1,7 +1,10 @@
 package log
 
 import (
+	"fmt"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"os"
 	"sync"
 )
 
@@ -11,7 +14,7 @@ var instance *zap.SugaredLogger
 func GetLog() *zap.SugaredLogger {
 	once.Do(func() {
 		// 第一种方式
-		logger, _ := zap.NewDevelopment()
+		//logger, _ := zap.NewDevelopment()
 
 		//第二种方式
 		//encoderCfg := zap.NewProductionEncoderConfig()
@@ -38,18 +41,18 @@ func GetLog() *zap.SugaredLogger {
 		//logger := zap.Must(config.Build())
 
 		// 第三种方式 基准测试或者生产环境下用这种
-		//file, _ := os.Create("./test.log")
-		//writeSyncer := zapcore.AddSync(file)
-		//encoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
-		//core := zapcore.NewCore(encoder, writeSyncer, zapcore.WarnLevel)
-		//logger := zap.New(core)
-		//
-		//defer func() {
-		//	err := logger.Sync()
-		//	if err != nil {
-		//		fmt.Println(err)
-		//	}
-		//}() // flushes buffer
+		file, _ := os.Create("./test.log")
+		writeSyncer := zapcore.AddSync(file)
+		encoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+		core := zapcore.NewCore(encoder, writeSyncer, zapcore.WarnLevel)
+		logger := zap.New(core)
+
+		defer func() {
+			err := logger.Sync()
+			if err != nil {
+				fmt.Println(err)
+			}
+		}() // flushes buffer
 
 		instance = logger.Sugar()
 		instance.Infof("success to init zapLog")
