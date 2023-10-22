@@ -179,6 +179,39 @@ func (node *Node) Init() {
 	//	}
 	//}
 
+	// 在server端本地进行手动单机的set接口基准测试
+	/*
+		测试结果：
+	*/
+
+	if node.Config.SelfPort == "9990" {
+		for i := 1; i <= 3; i++ {
+			go func() {
+				time.Sleep(5 * time.Second)
+				var count int64 = 0
+				start := time.Now().UnixMilli()
+				for {
+					end := time.Now().UnixMilli()
+					if end-start > 3*1000 {
+						break
+					}
+					go func() {
+						isSuccess := node.HandlerClientRequestAloneMode(&rpc.ClientRPCArgs{
+							Tp: rpc.CLIENT_REQ_TYPE_SET,
+							K:  "key1",
+							V:  "value1",
+						})
+						if isSuccess {
+							atomic.AddInt64(&count, 1)
+						}
+
+					}()
+				}
+				fmt.Printf("本次测试3s内set成功调用次数为：%d \n", atomic.LoadInt64(&count))
+			}()
+		}
+	}
+
 	// 在server端本地进行手动的get接口基准测试
 	/*
 		在13600k CPU (14核20线程) 测试条件下三次结果：
@@ -854,6 +887,22 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 		}
 	}
 	Log.Infof("end but not within expectations")
+	return false
+}
+
+func (node *Node) HandlerClientRequestAloneMode(argsStruct *rpc.ClientRPCArgs) bool {
+	entry := &rpc.LogEntry{
+		Index: node.CommitIndex + 1,
+		Term:  1,
+		K:     argsStruct.K,
+		V:     argsStruct.V,
+	}
+	node.Config.LogModule.Set(entry)
+	success := node.StateMachine.Set(entry)
+	if success {
+		node.CommitIndex += 1
+		return true
+	}
 	return false
 }
 
