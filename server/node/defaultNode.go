@@ -856,6 +856,7 @@ func (node *Node) HandlerClientRequestWitchOnlyUsedByBenchmarkTest(argsStruct *r
 	Log.Infof("end but not within expectations")
 	return false
 }
+
 func (node *Node) HandlerRequestVote(ctx context.Context, args *any, reply *any) error {
 	return node.Consensus.HandlerRequestVote(args, reply)
 }
